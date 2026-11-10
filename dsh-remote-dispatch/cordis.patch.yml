@@ -1,0 +1,29 @@
+# dsh-remote-dispatch bundle patch.
+# Inserts one Host row. The row's config is what the Settings/users edit:
+# which cloud hosts exist, and defaults. Host credentials are referenced from
+# the DSH credential store (credential-vault records) by id, so no secret ever
+# lives in this file.
+- insert:
+    - id: remote-dispatch
+      name: dsh-remote-dispatch
+      config:
+        # Which host is used when a call does not name one.
+        defaultHost: aliyun
+        # Cloud hosts. `credentialId` points at an ssh record in the DSH
+        # credential store; that record supplies user/host/password/key.
+        hosts:
+          aliyun:
+            credentialId: ssh-xxxxxxxxxxxx   # 换成凭据管家里你自己的 SSH 凭据 id
+            label: 我的云主机 A
+          tencent:
+            credentialId: ssh-yyyyyyyyyyyy
+            label: 我的云主机 B
+        # Append a short section to the system prompt so the model knows it can
+        # offload long work to the cloud.
+        promptSummary: true
+        # How long a single remote control command may take, in milliseconds.
+        commandTimeoutMs: 120000
+        # How long `wait` may block, in milliseconds.
+        waitTimeoutMs: 3600000
+        # Upper bound for a directory upload, in megabytes.
+        maxUploadMb: 200

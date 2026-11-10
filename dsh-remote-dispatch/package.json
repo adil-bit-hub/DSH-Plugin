@@ -1,0 +1,42 @@
+{
+  "name": "dsh-remote-dispatch",
+  "version": "0.1.0",
+  "private": true,
+  "description": "把 DSH 任务派发到云端服务器执行：本地断网、关机都不影响云端继续跑，回来取结果。支持目录同步、会话续跑、多主机。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "src",
+    "cordis.patch.yml",
+    "remote",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "remote",
+    "dispatch",
+    "cloud",
+    "ssh"
+  ],
+  "license": "MIT",
+  "author": "tragi",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  }
+}

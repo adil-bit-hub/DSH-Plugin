@@ -1,0 +1,20 @@
+# 依赖与构建产物
+node_modules/
+dist/
+build/
+
+# 运行时产物
+*.log
+__pycache__/
+
+# 本机私有数据（绝不入库）
+.credentials.yaml
+*.credentials.yaml
+backups/
+*.tar.gz
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
