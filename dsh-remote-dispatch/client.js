@@ -241,99 +241,63 @@ window.__ModuleLoader__.load({
     // ---------------------------------------------------------------- panel
 
 /**
-     * 「协同推送」控制条。
+     * 输入框旁的「云端」按钮。
      *
-     * 默认行为就是把当前会话整体搬到云端：整段对话以文字记录随任务下发，本会话
-     * 所在的项目目录自动打包上传（不需要手填路径）。执行完成后可以一键把云端的
-     * 工作目录拉回本地，形成往返同步。
+     * 像在本地一样操作云端：选设备 → 选/建项目 → 写任务 → 发送。
+     * 任务在云端项目目录里执行，不需要上传任何东西（需要文件时去设置页传）。
      */
     function PushControl(props) {
       const [open, setOpen] = React.useState(false)
       const [devices, setDevices] = React.useState([])
       const [defaultDevice, setDefaultDevice] = React.useState('')
-      const [selected, setSelected] = React.useState('')
-      const [info, setInfo] = React.useState(null)
-      const [infoError, setInfoError] = React.useState('')
-      const [sessions, setSessions] = React.useState([])
-      const [sessionId, setSessionId] = React.useState('')
-      const [instruction, setInstruction] = React.useState('')
-      const [syncFiles, setSyncFiles] = React.useState(true)
+      const [device, setDevice] = React.useState('')
+      const [projects, setProjects] = React.useState([])
       const [project, setProject] = React.useState('')
+      const [newProject, setNewProject] = React.useState('')
+      const [creating, setCreating] = React.useState(false)
+      const [task, setTask] = React.useState('')
       const [busy, setBusy] = React.useState(false)
-      const [percent, setPercent] = React.useState(0)
-      const [phase, setPhase] = React.useState('')
-      const [detail, setDetail] = React.useState('')
+      const [notice, setNotice] = React.useState('')
       const [error, setError] = React.useState('')
       const [job, setJob] = React.useState(null)
-      const [pulling, setPulling] = React.useState(false)
-      const [pullResult, setPullResult] = React.useState(null)
       const rootRef = React.useRef(null)
+      const taskRef = React.useRef(null)
 
-      // 打开时读取设备与本会话信息
+      // 打开时读设备
       React.useEffect(() => {
         if (!open) return
         let alive = true
-        // 两个请求互不拖累：会话信息失败也要能选设备，反之亦然。
         callRpc('hosts', {})
-          .then((hostsValue) => {
-            if (!alive) return
-            const list = hostsValue.devices || []
-            setDevices(list)
-            setDefaultDevice(hostsValue.defaultHost || '')
-            setSelected((cur) => cur || hostsValue.defaultHost || (list[0] && list[0].name) || '')
-          })
-          .catch((err) => {
-            if (alive) setInfoError((prev) => prev || `设备读取失败：${err.message}`)
-          })
-        callRpc('sessions', { limit: 12 })
           .then((value) => {
             if (!alive) return
-            const list = value.sessions || []
-            setSessions(list)
-            setSessionId((cur) => {
-              if (cur) return cur
-              // 优先用上次成功推送过的会话，其次用最新的一条
-              let remembered = ''
-              try {
-                remembered = window.localStorage.getItem('drd.sessionId') || ''
-              } catch {
-                remembered = ''
-              }
-              if (remembered && list.some((item) => item.sessionId === remembered)) return remembered
-              return (list[0] && list[0].sessionId) || ''
-            })
+            const list = value.devices || []
+            setDevices(list)
+            setDefaultDevice(value.defaultHost || '')
+            setDevice((cur) => cur || value.defaultHost || (list[0] && list[0].name) || '')
           })
-          .catch((err) => {
-            if (alive) setInfoError((prev) => prev || `会话列表读取失败：${err.message}`)
-          })
+          .catch((err) => alive && setError(`设备读取失败：${err.message}`))
         return () => {
           alive = false
         }
       }, [open])
 
-      // 选中哪个会话，就读哪个会话的轮次与文件
-      React.useEffect(() => {
-        if (!open || sessionId === '') return
-        let alive = true
-        setInfoError('')
+      // 设备变化时读项目
+      const loadProjects = React.useCallback(async (hostName) => {
+        if (!hostName) return
         try {
-          window.localStorage.setItem('drd.sessionId', sessionId)
-        } catch {
-          // 隐私模式下忽略
+          const value = await callRpc('projects', { host: hostName })
+          const list = value.projects || []
+          setProjects(list)
+          setProject((cur) => (cur && list.some((p) => p.name === cur) ? cur : (list[0] && list[0].name) || ''))
+        } catch (err) {
+          setError(`项目读取失败：${err.message}`)
         }
-        callRpc('sessionInfo', { sessionId })
-          .then((infoValue) => {
-            if (!alive) return
-            setInfo(infoValue)
-            setProject((cur) => cur || infoValue.project || '')
-          })
-          .catch((err) => {
-            if (alive) setInfoError(err.message)
-          })
-        return () => {
-          alive = false
-        }
-      }, [open, sessionId])
+      }, [])
+
+      React.useEffect(() => {
+        if (!open || !device) return
+        loadProjects(device)
+      }, [open, device, loadProjects])
 
       React.useEffect(() => {
         if (!open) return
@@ -344,95 +308,53 @@ window.__ModuleLoader__.load({
         return () => document.removeEventListener('mousedown', onDown, true)
       }, [open])
 
-      const start = async () => {
+      const doCreateProject = async () => {
+        const name = newProject.trim()
+        if (name === '') return
+        setCreating(true)
+        setError('')
+        try {
+          const value = await callRpc('createProject', { host: device, name })
+          setNewProject('')
+          await loadProjects(device)
+          setProject(value.name)
+          setNotice(`已创建项目 ${value.name}`)
+        } catch (err) {
+          setError(err.message)
+        } finally {
+          setCreating(false)
+        }
+      }
+
+      const send = async () => {
         if (busy) return
-        if (selected === '') {
-          setError('请先选择一个云端设备。')
+        if (task.trim() === '') {
+          setError('请先填写任务内容。')
+          taskRef.current?.focus()
+          return
+        }
+        if (project === '') {
+          setError('请先选择或创建项目。')
           return
         }
         setBusy(true)
         setError('')
+        setNotice('')
         setJob(null)
-        setPullResult(null)
-        setPercent(0)
-        setPhase('packing')
-        setDetail('准备推送整段对话')
         try {
-          await streamRpc(
-            'pushSession',
-            {
-              sessionId: sessionId || (info ? info.sessionId : undefined),
-              instruction,
-              host: selected,
-              project: project || undefined,
-              syncFiles,
-            },
-            (line) => {
-              if (line.type === 'progress') {
-                setPercent(typeof line.percent === 'number' ? line.percent : 0)
-                setPhase(line.phase || '')
-                setDetail(line.detail || '')
-              } else if (line.type === 'done') {
-                setPercent(100)
-                setPhase('done')
-                setDetail('已派发')
-                setJob(line.result)
-              } else if (line.type === 'error') {
-                setError((line.error && line.error.message) || '派发失败')
-                setPhase('error')
-              }
-            },
-          )
+          const value = await callRpc('push', { host: device, project, task })
+          setJob(value)
+          setTask('')
+          setNotice('已在云端项目里开始执行')
         } catch (err) {
-          setError(err && err.message ? err.message : String(err))
-          setPhase('error')
+          setError(err.message)
         } finally {
           setBusy(false)
         }
       }
 
-      const doPull = async () => {
-        if (pulling || !job) return
-        setPulling(true)
-        setError('')
-        setPullResult(null)
-        setPercent(0)
-        setPhase('packing')
-        setDetail('准备拉回')
-        try {
-          await streamRpc(
-            'pull',
-            { host: job.host || selected, project: job.project || project, localDir: job.localDir || (info && info.localDir) },
-            (line) => {
-              if (line.type === 'progress') {
-                setPercent(typeof line.percent === 'number' ? line.percent : 0)
-                setPhase(line.phase || '')
-                setDetail(line.detail || '')
-              } else if (line.type === 'done') {
-                setPercent(100)
-                setPhase('done')
-                setDetail('已同步回本地')
-                setPullResult(line.result)
-              } else if (line.type === 'error') {
-                setError((line.error && line.error.message) || '拉回失败')
-                setPhase('error')
-              }
-            },
-          )
-        } catch (err) {
-          setError(err && err.message ? err.message : String(err))
-          setPhase('error')
-        } finally {
-          setPulling(false)
-        }
-      }
-
-      const phaseIndex = PHASES.findIndex((item) => item.key === phase)
-      const active = busy || pulling
-      const fillClass =
-        phase === 'error' ? 'drd-barFill drd-barFillErr' : phase === 'done' ? 'drd-barFill drd-barFillOk' : 'drd-barFill'
-      const selectedDevice = devices.find((d) => d.name === selected)
-      const currentLabel = selectedDevice ? selectedDevice.label || selectedDevice.name : ''
+      const selectedDevice = devices.find((d) => d.name === device)
+      const label = selectedDevice ? selectedDevice.label || selectedDevice.name : ''
 
       return h(
         'div',
@@ -441,11 +363,11 @@ window.__ModuleLoader__.load({
           'button',
           {
             type: 'button',
-            className: active ? 'drd-btn drd-btnBusy' : 'drd-btn',
-            title: '把对话记录写成文件 + 同步项目文件，推到云端执行（本地断网也不影响）',
+            className: busy ? 'drd-btn drd-btnBusy' : 'drd-btn',
+            title: '在云端项目里开任务（不需要上传文件，直接跑）',
             onClick: () => setOpen((v) => !v),
           },
-          active
+          busy
             ? h('span', { className: 'drd-dot' })
             : h('span', { className: 'drd-icon', 'aria-hidden': 'true' },
                 h('svg', { width: 12, height: 12, viewBox: '0 0 16 16', fill: 'none' },
@@ -453,8 +375,8 @@ window.__ModuleLoader__.load({
                     d: 'M8 2v8m0-8L4.5 5.5M8 2l3.5 3.5M3 11v1.5A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V11',
                     stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round', strokeLinejoin: 'round',
                   }))),
-          active ? `${percent}%` : '推送',
-          h('span', { className: 'drd-btnDev' }, currentLabel || '云端'),
+          busy ? '发送中' : '云端任务',
+          label ? h('span', { className: 'drd-btnDev' }, label) : null,
         ),
 
         open
@@ -464,191 +386,109 @@ window.__ModuleLoader__.load({
               h(
                 'div',
                 { className: 'drd-head' },
-                h('span', { className: 'drd-title' }, '推送到云端'),
+                h('span', { className: 'drd-title' }, '在云端跑任务'),
                 h('button', { type: 'button', className: 'drd-close', onClick: () => setOpen(false), title: '关闭' }, '×'),
-              ),
-
-              // 选择要搬运的会话（插件无法得知你正在看哪个，必须由你确认）
-              h(
-                'div',
-                { style: { marginBottom: '9px' } },
-                h('span', { className: 'drd-label' }, '要搬运的会话'),
-                h(
-                  'select',
-                  {
-                    className: 'drd-select',
-                    value: sessionId,
-                    onChange: (e) => setSessionId(e.target.value),
-                    disabled: active,
-                  },
-                  sessions.length === 0
-                    ? h('option', { value: '' }, '读取中…')
-                    : sessions.map((item) =>
-                        h(
-                          'option',
-                          { key: item.sessionId, value: item.sessionId },
-                          `${item.project || '（无目录）'} · ${item.turns ?? 0} 轮 · ${item.fileCount ?? 0} 文件 · ${new Date(item.updatedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}`,
-                        ),
-                      ),
-                ),
-                h('div', { className: 'drd-hint' }, '默认选最新的一条；如果不是你正在看的那个，在这里改'),
-              ),
-
-              // 会话概况
-              h(
-                'div',
-                { className: 'drd-session' },
-                info
-                  ? h(
-                      'div',
-                      null,
-                      h('div', { className: 'drd-sessionMain' },
-                        h('span', { className: 'drd-tag drd-tagOk' }, '本会话'),
-                        h('span', null, `${info.turns} 轮对话 · ${(info.transcriptChars / 1000).toFixed(1)}k 字`),
-                        h('span', { className: 'drd-tag' }, `${info.fileCount ?? 0} 个文件`),
-                        info.truncated ? h('span', { className: 'drd-tag' }, '已截断') : null,
-                      ),
-                      h('div', { className: 'drd-sessionPath' }, info.localDir || '（未识别到项目目录）'),
-                    )
-                  : h('div', { className: 'drd-hint' }, infoError ? `读取会话失败：${infoError}` : '读取会话中…'),
               ),
 
               // 设备
               h(
                 'div',
-                { style: { marginBottom: '11px' } },
-                h('span', { className: 'drd-label' }, '目标设备'),
+                { style: { marginBottom: '9px' } },
+                h('span', { className: 'drd-label' }, '云端设备'),
                 devices.length === 0
                   ? h('div', { className: 'drd-empty' }, '还没有绑定设备。到 设置 → 云端派发 用 SSH 关联一台服务器。')
                   : h(
                       'div',
                       { className: 'drd-devices' },
-                      devices.map((device) =>
+                      devices.map((d) =>
                         h(
                           'button',
                           {
-                            key: device.name,
+                            key: d.name,
                             type: 'button',
-                            className: device.name === selected ? 'drd-device drd-deviceOn' : 'drd-device',
-                            onClick: () => setSelected(device.name),
-                            disabled: active,
+                            className: d.name === device ? 'drd-device drd-deviceOn' : 'drd-device',
+                            onClick: () => setDevice(d.name),
+                            disabled: busy,
                           },
-                          h('span', { className: device.name === selected ? 'drd-radio drd-radioOn' : 'drd-radio' }),
+                          h('span', { className: d.name === device ? 'drd-radio drd-radioOn' : 'drd-radio' }),
                           h(
                             'span',
                             { className: 'drd-deviceMain' },
-                            h(
-                              'span',
-                              { className: 'drd-deviceName' },
-                              device.label || device.name,
-                              device.name === defaultDevice ? h('span', { className: 'drd-tag' }, '默认') : null,
-                            ),
-                            h(
-                              'span',
-                              { className: 'drd-deviceAddr' },
-                              device.ssh && device.ssh.host
-                                ? `${device.ssh.username}@${device.ssh.host}:${device.ssh.port}`
-                                : device.credentialId,
-                            ),
+                            h('span', { className: 'drd-deviceName' },
+                              d.label || d.name,
+                              d.name === defaultDevice ? h('span', { className: 'drd-tag' }, '默认') : null),
+                            h('span', { className: 'drd-deviceAddr' },
+                              d.ssh && d.ssh.host ? `${d.ssh.username}@${d.ssh.host}:${d.ssh.port}` : d.credentialId),
                           ),
                         ),
                       ),
                     ),
               ),
 
-              // 项目名
+              // 项目
               h(
                 'div',
                 { style: { marginBottom: '9px' } },
-                h('span', { className: 'drd-label' }, '云端项目名（工作目录）'),
-                h('input', {
-                  className: 'drd-input',
-                  value: project,
-                  placeholder: '默认用本地目录名',
-                  onChange: (e) => setProject(e.target.value),
-                  disabled: active,
-                }),
+                h('span', { className: 'drd-label' }, '项目（云端工作目录）'),
+                h(
+                  'select',
+                  { className: 'drd-select', value: project, onChange: (e) => setProject(e.target.value), disabled: busy },
+                  projects.length === 0
+                    ? h('option', { value: '' }, '（还没有项目，先建一个）')
+                    : projects.map((p) =>
+                        h('option', { key: p.name, value: p.name }, `${p.name} · ${p.files} 文件`)),
+                ),
+                h(
+                  'div',
+                  { style: { display: 'flex', gap: '6px', marginTop: '6px' } },
+                  h('input', {
+                    className: 'drd-input',
+                    value: newProject,
+                    placeholder: '新建项目名，例如 blog',
+                    onChange: (e) => setNewProject(e.target.value),
+                    onKeyDown: (e) => { if (e.key === 'Enter') doCreateProject() },
+                    disabled: busy || creating,
+                  }),
+                  h('button', {
+                    type: 'button', className: 'drd-mini',
+                    onClick: doCreateProject,
+                    disabled: busy || creating || newProject.trim() === '',
+                  }, creating ? '创建中' : '新建'),
+                ),
               ),
 
-              // 同步项目文件开关
-              h(
-                'label',
-                { className: 'drd-check' },
-                h('input', {
-                  type: 'checkbox',
-                  checked: syncFiles,
-                  onChange: (e) => setSyncFiles(e.target.checked),
-                  disabled: active,
-                }),
-                h('span', null, info ? `同步本会话涉及的 ${info.fileCount ?? 0} 个文件（供云端参考）` : '同步本会话涉及的文件（供云端参考）'),
-                h('span', { className: 'drd-hint', style: { marginTop: 0 } }, '（只传这次对话真正碰过的文件，保持相对路径）'),
-              ),
-
-              // 追加指令
-              h('span', { className: 'drd-label', style: { marginTop: '10px' } }, '希望云端接着做什么（可选）'),
+              // 任务
+              h('span', { className: 'drd-label' }, '任务内容'),
               h('textarea', {
+                ref: taskRef,
                 className: 'drd-textarea',
-                value: instruction,
-                placeholder: '留空则让云端继续完成最后一件未完成的事',
-                onChange: (e) => setInstruction(e.target.value),
-                disabled: active,
-                rows: 2,
+                value: task,
+                placeholder: '例如：读一下项目里的 README，补一份安装说明',
+                onChange: (e) => setTask(e.target.value),
+                disabled: busy,
+                rows: 3,
               }),
 
-              busy || pulling || phase === 'done' || phase === 'error'
-                ? h(
-                    'div',
-                    { className: 'drd-progressWrap' },
-                    h('div', { className: 'drd-progressTop' }, h('span', null, detail || '处理中'), h('span', null, `${percent}%`)),
-                    h('div', { className: 'drd-bar' }, h('div', { className: fillClass, style: { width: `${Math.max(2, percent)}%` } })),
-                    h(
-                      'div',
-                      { className: 'drd-steps' },
-                      PHASES.map((item, index) =>
-                        h('div', { key: item.key, className: index <= phaseIndex ? 'drd-step drd-stepOn' : 'drd-step', title: item.label }),
-                      ),
-                    ),
-                  )
-                : null,
-
+              notice ? h('div', { className: 'drd-msg drd-msgOk' }, notice) : null,
               job
                 ? h(
                     'div',
                     { className: 'drd-msg drd-msgOk' },
-                    h('div', null, '已推送到云端，本地可断网／关机。'),
+                    h('div', null, '任务已提交，本地断网也不影响。'),
                     h('div', { className: 'drd-job' }, job.jobId),
-                    h('div', null, `${job.host} · ${job.remoteRoot || ''}`),
-                    h('div', null, `对话记录存为 CONVERSATION.md（${job.turns} 轮），提示词仅 ${job.promptChars || 0} 字`),
-                    h('div', null, job.filesSynced ? `已同步本会话涉及的 ${job.fileCount ?? 0} 个文件，云端会先读记录再动手` : '本次未同步文件'),
-                    h(
-                      'div',
-                      { className: 'drd-banner' },
-                      h('span', null, '任务跑完后可把云端改动拉回本地：'),
-                      h('button', { type: 'button', className: 'drd-mini', onClick: doPull, disabled: pulling }, pulling ? '同步中…' : '拉回本地'),
-                    ),
+                    h('div', null, `${job.host} · ${job.remoteRoot}`),
                   )
                 : null,
-
-              pullResult
-                ? h(
-                    'div',
-                    { className: 'drd-msg drd-msgOk' },
-                    h('div', null, '已同步回本地。'),
-                    h('div', null, pullResult.localDir),
-                    h('div', { className: 'drd-hint' }, `覆盖前备份：${pullResult.backup}`),
-                  )
-                : null,
-
               error ? h('div', { className: 'drd-msg drd-msgErr' }, error) : null,
 
               h(
                 'div',
                 { className: 'drd-actions' },
-                h('button', { type: 'button', className: 'drd-ghost', onClick: () => setOpen(false), disabled: active }, '关闭'),
+                h('button', { type: 'button', className: 'drd-ghost', onClick: () => setOpen(false), disabled: busy }, '关闭'),
                 h(
                   'button',
-                  { type: 'button', className: 'drd-primary', onClick: start, disabled: active || selected === '' },
-                  busy ? '推送中…' : selected === '' ? '请选择设备' : '推送整段对话',
+                  { type: 'button', className: 'drd-primary', onClick: send, disabled: busy || project === '' },
+                  busy ? '提交中…' : '在云端执行',
                 ),
               ),
             )
@@ -656,7 +496,6 @@ window.__ModuleLoader__.load({
       )
     }
 
-    // ------------------------------------------------------------- settings
 
     /**
      * Pushed-job history for one device. This is the reliable place to watch
@@ -773,6 +612,361 @@ window.__ModuleLoader__.load({
       )
     }
 
+/**
+     * 云端项目管理：像本地一样建项目、看文件、传文件、跑任务、取结果。
+     */
+    function ProjectsPanel(props) {
+      const devices = props.devices || []
+      const [device, setDevice] = React.useState('')
+      const [projects, setProjects] = React.useState([])
+      const [loading, setLoading] = React.useState(false)
+      const [error, setError] = React.useState('')
+      const [notice, setNotice] = React.useState('')
+      const [newName, setNewName] = React.useState('')
+      const [busy, setBusy] = React.useState(false)
+
+      // 当前打开的项目
+      const [current, setCurrent] = React.useState(null)
+      const [files, setFiles] = React.useState([])
+      const [tasks, setTasks] = React.useState([])
+      const [detailLoading, setDetailLoading] = React.useState(false)
+
+      // 上传 / 新任务
+      const [uploadPath, setUploadPath] = React.useState('')
+      const [uploadSubdir, setUploadSubdir] = React.useState('')
+      const [uploading, setUploading] = React.useState(false)
+      const [uploadPct, setUploadPct] = React.useState(0)
+      const [taskText, setTaskText] = React.useState('')
+      const [starting, setStarting] = React.useState(false)
+      const [taskResult, setTaskResult] = React.useState(null)
+      const [localDir, setLocalDir] = React.useState('')
+
+      React.useEffect(() => {
+        if (device === '' && devices.length > 0) setDevice(devices[0].name)
+      }, [devices, device])
+
+      const load = React.useCallback(async () => {
+        if (device === '') return
+        setLoading(true)
+        setError('')
+        try {
+          const value = await callRpc('projects', { host: device })
+          setProjects(value.projects || [])
+        } catch (err) {
+          setError(err.message)
+          setProjects([])
+        } finally {
+          setLoading(false)
+        }
+      }, [device])
+
+      React.useEffect(() => {
+        setCurrent(null)
+        load()
+      }, [load])
+
+      const openProject = async (name) => {
+        setCurrent(name)
+        setDetailLoading(true)
+        setError('')
+        setTaskResult(null)
+        try {
+          const [f, t] = await Promise.all([
+            callRpc('projectFiles', { host: device, project: name }),
+            callRpc('projectTasks', { host: device, project: name }),
+          ])
+          setFiles(f.files || [])
+          setTasks(t.tasks || [])
+        } catch (err) {
+          setError(err.message)
+          setFiles([])
+          setTasks([])
+        } finally {
+          setDetailLoading(false)
+        }
+      }
+
+      const createProject = async () => {
+        const name = newName.trim()
+        if (name === '') return
+        setBusy(true)
+        setError('')
+        try {
+          await callRpc('createProject', { host: device, name })
+          setNewName('')
+          setNotice(`已创建项目 ${name}`)
+          await load()
+          await openProject(name)
+        } catch (err) {
+          setError(err.message)
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const removeProject = async (name) => {
+        if (!window.confirm(`确定删除云端项目 ${name}？该目录下的文件会一起删除。`)) return
+        setBusy(true)
+        setError('')
+        try {
+          await callRpc('removeProject', { host: device, name, confirm: true })
+          setNotice(`已删除项目 ${name}`)
+          if (current === name) setCurrent(null)
+          await load()
+        } catch (err) {
+          setError(err.message)
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const doUpload = async () => {
+        if (current === null || uploadPath.trim() === '') return
+        setUploading(true)
+        setError('')
+        setNotice('')
+        setUploadPct(0)
+        try {
+          await streamRpc(
+            'uploadToProject',
+            { host: device, project: current, localPath: uploadPath.trim(), subdir: uploadSubdir.trim() },
+            (line) => {
+              if (line.type === 'progress') setUploadPct(line.percent || 0)
+              else if (line.type === 'done') {
+                setUploadPct(100)
+                setNotice(`已上传到 ${line.result.remoteDir}`)
+                setUploadPath('')
+              } else if (line.type === 'error') {
+                setError((line.error && line.error.message) || '上传失败')
+              }
+            },
+          )
+          await openProject(current)
+          await load()
+        } catch (err) {
+          setError(err.message)
+        } finally {
+          setUploading(false)
+        }
+      }
+
+      const startTask = async () => {
+        if (current === null || taskText.trim() === '') return
+        setStarting(true)
+        setError('')
+        setTaskResult(null)
+        try {
+          const value = await callRpc('push', { host: device, project: current, task: taskText.trim() })
+          setTaskResult(value)
+          setTaskText('')
+          await openProject(current)
+        } catch (err) {
+          setError(err.message)
+        } finally {
+          setStarting(false)
+        }
+      }
+
+      const showResult = async (jobId) => {
+        try {
+          const value = await callRpc('result', { jobId, host: device })
+          setTaskResult({ jobId, text: value.text })
+        } catch (err) {
+          setTaskResult({ jobId, text: `（还没结果）${err.message}` })
+        }
+      }
+
+      const downloadFile = async (path) => {
+        setError('')
+        if (localDir.trim() === '') {
+          setError('请先在「下载到」里填一个本地目录。')
+          return
+        }
+        try {
+          await streamRpc(
+            'downloadFromProject',
+            { host: device, project: current, remotePath: path, localDir: localDir.trim() },
+            (line) => {
+              if (line.type === 'done') setNotice(`已下载到 ${line.result.localDir}`)
+              else if (line.type === 'error') setError((line.error && line.error.message) || '下载失败')
+            },
+          )
+        } catch (err) {
+          setError(err.message)
+        }
+      }
+
+      const sizeText = (bytes) => (bytes > 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)}MB` : `${Math.max(0, Math.round(bytes / 1024))}KB`)
+
+      return h(
+        'div',
+        { className: 'drd-card' },
+        h(
+          'div',
+          { className: 'drd-cardHead' },
+          h('span', { className: 'drd-cardTitle' }, '云端项目'),
+          h(
+            'div',
+            { style: { display: 'flex', gap: '8px', alignItems: 'center' } },
+            h(
+              'select',
+              { className: 'drd-select', style: { width: '160px' }, value: device, onChange: (e) => setDevice(e.target.value) },
+              devices.length === 0
+                ? h('option', { value: '' }, '（无设备）')
+                : devices.map((d) => h('option', { key: d.name, value: d.name }, d.label || d.name)),
+            ),
+            h('button', { type: 'button', className: 'drd-mini', onClick: load, disabled: loading || device === '' }, loading ? '读取中…' : '刷新'),
+          ),
+        ),
+
+        notice ? h('div', { className: 'drd-msg drd-msgOk' }, notice) : null,
+        error ? h('div', { className: 'drd-msg drd-msgErr' }, error) : null,
+
+        // 新建项目
+        h(
+          'div',
+          { style: { display: 'flex', gap: '8px', marginBottom: '10px' } },
+          h('input', {
+            className: 'drd-input',
+            value: newName,
+            placeholder: '新建项目名（就是云端目录名）',
+            onChange: (e) => setNewName(e.target.value),
+            onKeyDown: (e) => { if (e.key === 'Enter') createProject() },
+            disabled: busy || device === '',
+          }),
+          h('button', { type: 'button', className: 'drd-primary', style: { flex: 'none' }, onClick: createProject, disabled: busy || newName.trim() === '' }, '新建'),
+        ),
+
+        // 项目列表
+        projects.length === 0
+          ? h('div', { className: 'drd-empty' }, loading ? '读取中…' : '这台设备上还没有项目，先新建一个。')
+          : projects.map((p) =>
+              h(
+                'div',
+                { key: p.name, className: 'drd-row' },
+                h(
+                  'div',
+                  { className: 'drd-rowMain' },
+                  h('div', { className: 'drd-rowName' }, p.name,
+                    current === p.name ? h('span', { className: 'drd-tag drd-tagOk' }, '已打开') : null),
+                  h('div', { className: 'drd-rowMeta' },
+                    `${p.files} 文件 · ${sizeText(p.bytes)} · ${p.updatedAt ? new Date(p.updatedAt).toLocaleString('zh-CN') : ''}`),
+                ),
+                h('button', { type: 'button', className: 'drd-mini', onClick: () => openProject(p.name), disabled: busy }, '进入'),
+                h('button', { type: 'button', className: 'drd-mini drd-miniDanger', onClick: () => removeProject(p.name), disabled: busy }, '删除'),
+              ),
+            ),
+
+        // 打开的项目详情
+        current
+          ? h(
+              'div',
+              { style: { marginTop: '12px', borderTop: '1px solid var(--dsw-alias-line-regular, #eceef1)', paddingTop: '12px' } },
+              h('div', { className: 'drd-cardTitle' }, `项目 ${current}`),
+              h('div', { className: 'drd-hint' }, detailLoading ? '读取中…' : `${files.length} 个文件 · ${tasks.length} 个任务`),
+
+              // 上传
+              h(
+                'div',
+                { style: { display: 'flex', gap: '6px', margin: '10px 0' } },
+                h('input', {
+                  className: 'drd-input',
+                  value: uploadPath,
+                  placeholder: '本地文件或目录的绝对路径',
+                  onChange: (e) => setUploadPath(e.target.value),
+                  disabled: uploading,
+                }),
+                h('input', {
+                  className: 'drd-input',
+                  style: { width: '110px', flex: 'none' },
+                  value: uploadSubdir,
+                  placeholder: '子目录(可空)',
+                  onChange: (e) => setUploadSubdir(e.target.value),
+                  disabled: uploading,
+                }),
+                h('button', {
+                  type: 'button', className: 'drd-mini', style: { flex: 'none' },
+                  onClick: doUpload,
+                  disabled: uploading || uploadPath.trim() === '',
+                }, uploading ? `${uploadPct}%` : '上传'),
+              ),
+
+              // 下载目录
+              h(
+                'div',
+                { style: { display: 'flex', gap: '6px', marginBottom: '8px' } },
+                h('input', {
+                  className: 'drd-input',
+                  value: localDir,
+                  placeholder: '下载到（本地目录绝对路径，如 C:\\Users\\you\\Downloads）',
+                  onChange: (e) => setLocalDir(e.target.value),
+                }),
+              ),
+
+              // 文件
+              h('div', { className: 'drd-label' }, '文件'),
+              files.length === 0
+                ? h('div', { className: 'drd-empty' }, '（空）')
+                : files.slice(0, 40).map((f) =>
+                    h(
+                      'div',
+                      { key: f.path, className: 'drd-row', style: { marginBottom: '4px', padding: '5px 8px' } },
+                      h('div', { className: 'drd-rowMain' },
+                        h('div', { className: 'drd-rowMeta', style: { marginTop: 0 } }, `${f.path}  ·  ${sizeText(f.bytes)}`)),
+                      h('button', { type: 'button', className: 'drd-mini', onClick: () => downloadFile(f.path) }, '下载'),
+                    ),
+                  ),
+
+              // 新任务
+              h('div', { className: 'drd-label', style: { marginTop: '12px' } }, '在这个项目里开任务'),
+              h(
+                'div',
+                { style: { display: 'flex', gap: '6px' } },
+                h('input', {
+                  className: 'drd-input',
+                  value: taskText,
+                  placeholder: '让云端在这个目录里做什么',
+                  onChange: (e) => setTaskText(e.target.value),
+                  onKeyDown: (e) => { if (e.key === 'Enter') startTask() },
+                  disabled: starting,
+                }),
+                h('button', {
+                  type: 'button', className: 'drd-primary', style: { flex: 'none' },
+                  onClick: startTask,
+                  disabled: starting || taskText.trim() === '',
+                }, starting ? '提交中' : '执行'),
+              ),
+
+              taskResult
+                ? h('div', { className: 'drd-msg drd-msgOk', style: { marginTop: '8px' } },
+                    h('div', { className: 'drd-job' }, taskResult.jobId),
+                    taskResult.text ? h('pre', { className: 'drd-pre' }, taskResult.text) : h('div', null, '任务已提交，稍后点「结果」查看。'))
+                : null,
+
+              // 任务列表
+              tasks.length > 0
+                ? h(
+                    'div',
+                    { style: { marginTop: '10px' } },
+                    h('div', { className: 'drd-label' }, '任务记录'),
+                    tasks.slice(0, 10).map((t) =>
+                      h(
+                        'div',
+                        { key: t.jobId, className: 'drd-row', style: { marginBottom: '4px', padding: '5px 8px' } },
+                        h('div', { className: 'drd-rowMain' },
+                          h('div', { className: 'drd-rowName' }, t.jobId,
+                            h('span', { className: t.state === 'done' ? 'drd-tag drd-tagOk' : t.state === 'failed' ? 'drd-tag drd-tagBad' : 'drd-tag' }, t.state)),
+                          h('div', { className: 'drd-rowMeta' }, t.submittedAt || '')),
+                        h('button', { type: 'button', className: 'drd-mini', onClick: () => showResult(t.jobId) }, '结果'),
+                      ),
+                    ),
+                  )
+                : null,
+            )
+          : null,
+      )
+    }
+
     function DevicesSection() {
       const [state, setState] = React.useState({ loading: true, devices: [], defaultDevice: '', credentials: [], maxUploadMb: 0 })
       const [busy, setBusy] = React.useState(false)
@@ -857,7 +1051,7 @@ window.__ModuleLoader__.load({
           'div',
           { className: 'drd-pageHead' },
           h('h2', null, '云端设备'),
-          h('p', null, '用 SSH 关联一台云服务器作为「设备」。派发任务时选择设备即可；电脑断网或关机，云端照常执行。密码与私钥仍由「凭据管家」保管，这里只记录绑定关系。'),
+          h('p', null, '用 SSH 关联云服务器作为「设备」。绑定后可以像本地一样在中控端管理云端项目：建项目、传文件、开任务、取结果。密码与私钥仍由「凭据管家」保管，这里只记录绑定关系。'),
         ),
 
         notice ? h('div', { className: 'drd-msg drd-msgOk', style: { marginBottom: '10px' } }, notice) : null,
@@ -997,7 +1191,7 @@ window.__ModuleLoader__.load({
           ),
         ),
 
-        h(JobsPanel, { devices: state.devices }),
+        h(ProjectsPanel, { devices: state.devices }),
       )
     }
 
@@ -1014,7 +1208,7 @@ window.__ModuleLoader__.load({
           name: 'settings.section',
           id: 'remote-dispatch',
           order: 35,
-          label: '云端派发',
+          label: '云端管理',
         }, DevicesSection))
       },
     }

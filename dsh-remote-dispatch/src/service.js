@@ -11,7 +11,7 @@
  * @module dsh-remote-dispatch/service
  */
 import { createReadStream, createWriteStream } from 'node:fs'
-import { access, mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { createGzip } from 'node:zlib'
 import { pipeline } from 'node:stream/promises'
 import { tmpdir } from 'node:os'
@@ -652,238 +652,324 @@ export class RemoteDispatchService {
   }
 
   /**
-   * Locate the session to migrate: an explicit id, or the most recently active
-   * session on this machine (composer slots carry no session id, so this is how
-   * the plugin finds "the conversation you are in").
+   * 云端项目根目录（所有项目都在这里）。
+   * @param {string} hostName
    */
-  async resolveSession(sessionId) {
-    const { newestSession, findLocalSession, buildTranscript, decodeSessionLog, parseEvents, collectTouchedFiles } =
-      await import('./sessions.js')
-    const home = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== ''
-      ? process.env.DSH_HOME
-      : join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.dsh')
-    const root = join(home, 'sessions')
-
-    const found = sessionId ? await findLocalSession(root, sessionId) : await newestSession(root)
-    if (!found) {
-      throw new RemoteError('session-not-found', sessionId ? `找不到会话 ${sessionId}。` : '本机没有可用的会话。')
-    }
-
-    const transcript = await buildTranscript(found.file, { maxChars: this.settings.transcriptMaxChars ?? 240_000 })
-
-    // Which files this conversation actually touched — the handoff ships these,
-    // not the whole tree.
-    let files = []
-    try {
-      const raw = await readFile(found.file)
-      const events = parseEvents(decodeSessionLog(raw))
-      files = collectTouchedFiles(events, transcript.cwd)
-    } catch {
-      files = []
-    }
-
-    return { ...found, ...transcript, files }
+  async workRoot(hostName) {
+    const home = await this.home(hostName)
+    return `${home}/dsh-work`
   }
 
   /**
-   * Push the whole conversation (plus this session's project files) to the cloud.
+   * 列出云端项目：每个 `~/dsh-work/<name>` 目录就是一个项目。
    *
-   * Design note: the conversation is NOT pasted into the task prompt. A long
-   * transcript in one prompt blows up the model's context and can crash the run.
-   * Instead the transcript is uploaded as a file next to the synced project and
-   * the task is a short brief telling the cloud agent to read it first — the
-   * agent decides what it needs, exactly as a human taking over would.
+   * 一次 SSH 往返拿全量（文件数 / 体积 / 更新时间），避免 N 个项目 N 次连接。
    *
-   * @param {object} input - { sessionId?, instruction?, host?, project?, syncFiles?, onProgress? }
+   * @param {string} [host]
+   * @returns {Promise<{host:string, root:string, projects:Array}>}
    */
-  async dispatchSession(input) {
-    const session = await this.resolveSession(input.sessionId)
-    const hostName = (await this.resolveHost(input.host)).name
+  async projects(host) {
+    const hostName = (await this.resolveHost(host)).name
     const t = await this.target(hostName)
-    const home = await this.home(hostName)
+    const root = await this.workRoot(hostName)
 
-    const project = this.safeProject(input.project || basename(session.cwd) || 'session')
-    const syncFiles = input.syncFiles !== false
-    const remoteRoot = `${home}/dsh-work/${project}`
-    const report = (patch) => {
-      try {
-        input.onProgress?.(patch)
-      } catch {
-        // progress must never fail the dispatch
-      }
-    }
-
-    // 1) upload ONLY the files this conversation touched
-    let uploadResult
-    if (syncFiles) {
-      uploadResult = await this.uploadFiles({
-        hostName,
-        remoteRoot,
-        cwd: session.cwd,
-        files: session.files ?? [],
-        tag: project,
-        report,
-      })
-    }
-
-    // 2) write the transcript to the cloud working directory
-    report({ phase: 'uploading', percent: 90, detail: '上传对话记录' })
-    const transcriptPath = `${remoteRoot}/CONVERSATION.md`
-    const transcriptDoc = renderTranscriptFile(session)
-    const put = await t.execWithStdin(
-      `mkdir -p ${shellQuote(remoteRoot)} && cat > ${shellQuote(transcriptPath)} && echo TRANSCRIPT_OK`,
-      Buffer.from(transcriptDoc, 'utf8'),
-    )
-    if (!put.stdout.includes('TRANSCRIPT_OK')) {
-      throw new RemoteError('transcript-upload-failed', `对话记录上传失败：${(put.stderr || put.stdout).trim().slice(0, 300)}`)
-    }
-
-    // 3) submit a SHORT task that points at the file
-    report({ phase: 'submitting', percent: 96, detail: '提交任务' })
-    const instruction = String(input.instruction ?? '').trim()
-    const brief = [
-      '你接手一段在本地进行中的对话，现在在云端继续。',
-      '',
-      `- 完整对话记录：当前目录下的 CONVERSATION.md（${session.turns} 轮）`,
-      syncFiles
-        ? `- 相关文件：本次会话涉及的 ${(session.files ?? []).length} 个文件已同步到当前目录（保持原有相对路径）`
-        : '- 相关文件：本次未同步，按对话记录中的信息处理',
-      '',
-      '先读 CONVERSATION.md 了解之前做了什么、做到哪一步，再决定需要看哪些文件；不要假设你记得内容。',
-      '',
-      instruction === '' ? '然后继续完成对话中最后一件尚未完成的事。' : `然后请：${instruction}`,
+    // 逐行拼命令：用 '; ' 连接会把 `do` 后面拼出 `do;`，shell 会报语法错误
+    const cmd = [
+      `mkdir -p ${shellQuote(root)}`,
+      `cd ${shellQuote(root)} || exit 1`,
+      'for d in */; do',
+      '  [ -d "$d" ] || continue',
+      '  n=${d%/}',
+      '  c=$(find "$n" -type f 2>/dev/null | wc -l)',
+      '  b=$(du -sb "$n" 2>/dev/null | cut -f1)',
+      '  m=$(stat -c %Y "$n" 2>/dev/null)',
+      '  echo "$n|$c|$b|$m"',
+      'done',
     ].join('\n')
 
-    const jobId = (input.jobId || this.makeJobId(project)).replace(/[^A-Za-z0-9._-]/g, '-')
-    const remoteTask = `/tmp/_dshtask-${jobId}.md`
-    const up = await t.execWithStdin(`cat > ${shellQuote(remoteTask)} && echo TASK_OK`, Buffer.from(brief, 'utf8'))
-    if (!up.stdout.includes('TASK_OK')) {
-      throw new RemoteError('task-upload-failed', `任务文本上传失败：${(up.stderr || up.stdout).trim()}`)
+    const r = await t.exec(cmd)
+    const projects = []
+    for (const line of (r.stdout || '').split(/\r?\n/)) {
+      const trimmed = line.trim()
+      if (trimmed === '') continue
+      const [name, files, bytes, mtime] = trimmed.split('|')
+      if (!name) continue
+      projects.push({
+        name,
+        path: `${root}/${name}`,
+        files: Number(files) || 0,
+        bytes: Number(bytes) || 0,
+        updatedAt: mtime ? new Date(Number(mtime) * 1000).toISOString() : '',
+      })
     }
-    const res = await t.exec(
-      `dsh-job submit ${shellQuote(jobId)} ${shellQuote(remoteRoot)} ${shellQuote(remoteTask)} && ` +
-        `rm -f ${shellQuote(remoteTask)}`,
-    )
-    if (res.code !== 0) {
-      throw new RemoteError('submit-failed', `提交失败：${(res.stderr || res.stdout).trim().slice(0, 800)}`)
+    projects.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
+    return { host: hostName, root, count: projects.length, projects }
+  }
+
+  /** 新建云端项目（就是一个空的工作目录）。 */
+  async createProject(input) {
+    const hostName = (await this.resolveHost(input.host)).name
+    const t = await this.target(hostName)
+    const root = await this.workRoot(hostName)
+    const name = this.safeProject(input.name, undefined)
+    const dir = `${root}/${name}`
+    assertWithin(root, dir)
+
+    const r = await t.exec(`mkdir -p ${shellQuote(dir)} && echo CREATE_OK`)
+    if (!r.stdout.includes('CREATE_OK')) {
+      throw new RemoteError('create-failed', (r.stderr || '创建目录失败').trim().slice(0, 300))
+    }
+    return { host: hostName, name, path: dir, created: true }
+  }
+
+  /** 删除云端项目。必须显式 confirm，避免手误。 */
+  async removeProject(input) {
+    const hostName = (await this.resolveHost(input.host)).name
+    const t = await this.target(hostName)
+    const root = await this.workRoot(hostName)
+    const name = this.safeProject(input.name, undefined)
+    const dir = `${root}/${name}`
+    assertWithin(root, dir)
+    if (dir === root) throw new RemoteError('invalid-project', '不能删除项目根目录。')
+    if (input.confirm !== true) {
+      throw new RemoteError('confirm-required', `删除 ${dir} 需要显式确认（confirm=true）。`)
     }
 
-    report({ phase: 'done', percent: 100, detail: '已派发' })
-
-    return {
-      jobId,
-      host: hostName,
-      ssh: t.label,
-      project,
-      remoteRoot,
-      localDir: syncFiles ? session.cwd : undefined,
-      filesSynced: syncFiles,
-      sessionId: session.sessionId,
-      turns: session.turns,
-      transcriptChars: session.text.length,
-      transcriptTruncated: session.truncated,
-      transcriptFile: transcriptPath,
-      promptChars: brief.length,
-      fileCount: (session.files ?? []).length,
-      files: session.files ?? [],
-      upload: uploadResult,
-      message:
-        `${jobId} 已派发到 ${hostName}：对话记录存为 CONVERSATION.md，` +
-        `${syncFiles ? `本会话涉及 ${(session.files ?? []).length} 个文件已同步，` : ''}` +
-        `任务提示词 ${brief.length} 字（不把全文塞进上下文）。`,
+    const r = await t.exec(`rm -rf ${shellQuote(dir)} && echo REMOVE_OK`)
+    if (!r.stdout.includes('REMOVE_OK')) {
+      throw new RemoteError('remove-failed', (r.stderr || '删除失败').trim().slice(0, 300))
     }
+    return { host: hostName, name, removed: true }
+  }
+
+  /** 列出项目内的文件（相对路径、大小、修改时间）。 */
+  async projectFiles(input) {
+    const hostName = (await this.resolveHost(input.host)).name
+    const t = await this.target(hostName)
+    const root = await this.workRoot(hostName)
+    const name = this.safeProject(input.project, undefined)
+    const dir = `${root}/${name}`
+    assertWithin(root, dir)
+
+    const depth = Math.max(1, Math.min(8, Number(input.depth) || 3))
+    const limit = Math.max(1, Math.min(2000, Number(input.limit) || 300))
+    const cmd =
+      `cd ${shellQuote(dir)} 2>/dev/null && ` +
+      `find . -maxdepth ${depth} -type f -printf '%P|%s|%T@\\n' 2>/dev/null | sort | head -n ${limit}`
+
+    const r = await t.exec(cmd)
+    if (r.code !== 0) {
+      throw new RemoteError('no-project', `云端没有项目 ${name}（${dir}）。`)
+    }
+    const files = []
+    for (const line of (r.stdout || '').split(/\r?\n/)) {
+      const trimmed = line.trim()
+      if (trimmed === '') continue
+      const [path, size, mtime] = trimmed.split('|')
+      if (!path) continue
+      files.push({
+        path,
+        bytes: Number(size) || 0,
+        updatedAt: mtime ? new Date(Number(mtime) * 1000).toISOString() : '',
+      })
+    }
+    return { host: hostName, project: name, path: dir, count: files.length, files }
   }
 
   /**
-   * Pull the cloud working directory back to the local project.
-   *
-   * Packing happens on the cloud (one tar), then the archive streams down and is
-   * unpacked over the local directory. Existing files are backed up first so a
-   * bad sync can be undone.
-   *
-   * @param {object} input - { host?, project, localDir?, onProgress? }
+   * 把本地文件或目录上传到云端项目（可指定子目录）。
+   * 传的是"你选的东西"，不是整个工作目录。
    */
-  async pull(input) {
+  async uploadToProject(input) {
+    const localPath = String(input.localPath ?? '').trim()
+    if (localPath === '') throw new RemoteError('no-input', '请提供要上传的本地文件或目录。')
+
     const hostName = (await this.resolveHost(input.host)).name
     const t = await this.target(hostName)
-    const home = await this.home(hostName)
-    const project = this.safeProject(input.project)
-    const remoteDir = `${home}/dsh-work/${project}`
+    const root = await this.workRoot(hostName)
+    const project = this.safeProject(input.project, undefined)
+    const projectDir = `${root}/${project}`
+    assertWithin(root, projectDir)
+
+    const subdir = String(input.subdir ?? '').trim().replace(/^[\\/]+|[\\/]+$/g, '')
+    const destDir = subdir === '' ? projectDir : `${projectDir}/${subdir}`
+    assertWithin(projectDir, destDir)
+
     const report = (patch) => {
       try {
         input.onProgress?.(patch)
       } catch {
-        // progress must never fail the sync
+        // 进度回调坏了也不能影响上传
       }
     }
 
-    report({ phase: 'packing', percent: 2, detail: '云端打包中' })
-    const remoteTar = `/tmp/_dshpull-${project}.tar.gz`
-    const pack = await t.exec(
-      `cd ${shellQuote(remoteDir)} && tar -czf ${shellQuote(remoteTar)} . && ` +
+    const resolved = resolve(localPath)
+    let info
+    try {
+      info = await stat(resolved)
+    } catch {
+      throw new RemoteError('not-found', `本地路径不存在：${resolved}`)
+    }
+
+    report({ phase: 'packing', percent: 2, detail: '打包本地内容' })
+
+    const { runProcess } = await import('./ssh.js')
+    const tmp = await mkdtemp(join(tmpdir(), 'dsh-project-upload-'))
+    const archive = join(tmp, 'payload.tar.gz')
+    try {
+      let bytes
+      if (info.isDirectory()) {
+        const packed = await this.packDirectory(resolved)
+        try {
+          await rename(packed.path, archive)
+          bytes = packed.bytes
+        } finally {
+          await packed.cleanup().catch(() => {})
+        }
+      } else {
+        // 单文件：只打它一个，落到目标目录同名位置
+        const base = basename(resolved)
+        const packed = await runProcess(
+          'tar',
+          ['-czf', archive, '-C', resolve(resolved, '..'), base],
+          {},
+          300_000,
+        )
+        if (packed.code !== 0) {
+          throw new RemoteError('pack-failed', `打包失败：${(packed.stderr || '').trim().slice(0, 300)}`)
+        }
+        bytes = (await stat(archive)).size
+      }
+
+      const mb = bytes / 1024 / 1024
+      if (mb > this.settings.maxUploadMb) {
+        throw new RemoteError('upload-too-large', `打包后 ${mb.toFixed(1)}MB，超过上限 ${this.settings.maxUploadMb}MB。`)
+      }
+
+      report({ phase: 'uploading', percent: 5, detail: `上传 ${mb.toFixed(2)}MB`, bytes, total: bytes })
+      const remoteTar = `/tmp/_dshup-${project}-${Date.now()}.tar.gz`
+      await this.uploadWithProgress(t, archive, bytes, remoteTar, report)
+
+      report({ phase: 'unpacking', percent: 93, detail: '云端解包中' })
+      const up = await t.exec(
+        `mkdir -p ${shellQuote(destDir)} && ` +
+          `tar -xzf ${shellQuote(remoteTar)} -C ${shellQuote(destDir)} --no-same-owner && ` +
+          `rm -f ${shellQuote(remoteTar)} && echo UPLOAD_OK`,
+        Math.max(this.settings.commandTimeoutMs, 600_000),
+      )
+      if (!up.stdout.includes('UPLOAD_OK')) {
+        throw new RemoteError('upload-failed', `解包失败：${(up.stderr || up.stdout).trim().slice(0, 400)}`)
+      }
+
+      report({ phase: 'done', percent: 100, detail: '上传完成' })
+      return {
+        host: hostName,
+        project,
+        remoteDir: destDir,
+        source: resolved,
+        kind: info.isDirectory() ? 'directory' : 'file',
+        bytes,
+        mb,
+      }
+    } finally {
+      await rm(tmp, { recursive: true, force: true }).catch(() => {})
+    }
+  }
+
+  /** 把云端项目里的某个文件/目录下载到本地。 */
+  async downloadFromProject(input) {
+    const hostName = (await this.resolveHost(input.host)).name
+    const t = await this.target(hostName)
+    const root = await this.workRoot(hostName)
+    const project = this.safeProject(input.project, undefined)
+    const projectDir = `${root}/${project}`
+    assertWithin(root, projectDir)
+
+    const remotePath = String(input.remotePath ?? '').trim().replace(/^[\\/]+/, '')
+    if (remotePath === '') throw new RemoteError('no-path', '请指定要下载的文件（项目内相对路径）。')
+    const target = `${projectDir}/${remotePath}`
+    assertWithin(projectDir, target)
+
+    const localDir = resolve(String(input.localDir ?? '').trim() || process.cwd())
+
+    const report = (patch) => {
+      try {
+        input.onProgress?.(patch)
+      } catch {
+        // ignore
+      }
+    }
+
+    report({ phase: 'packing', percent: 5, detail: '云端打包' })
+    const stamp = Date.now()
+    const remoteTar = `/tmp/_dshdown-${project}-${stamp}.tar.gz`
+    const packed = await t.exec(
+      `cd ${shellQuote(projectDir)} && tar -czf ${shellQuote(remoteTar)} -- ${shellQuote(remotePath)} && ` +
         `stat -c %s ${shellQuote(remoteTar)}`,
       Math.max(this.settings.commandTimeoutMs, 600_000),
     )
-    const totalBytes = Number((pack.stdout.trim().split(/\r?\n/).pop() || '0').trim()) || 0
-    if (totalBytes <= 0) {
-      throw new RemoteError('pull-empty', `云端 ${remoteDir} 打包失败或为空：${(pack.stderr || pack.stdout).trim().slice(0, 300)}`)
+    const bytes = Number((packed.stdout.trim().split(/\r?\n/).pop() || '0').trim()) || 0
+    if (bytes <= 0) {
+      throw new RemoteError('download-empty', `云端找不到 ${remotePath}：${(packed.stderr || '').trim().slice(0, 300)}`)
     }
 
-    report({ phase: 'downloading', percent: 10, detail: `下载 ${(totalBytes / 1024 / 1024).toFixed(2)}MB`, bytes: 0, total: totalBytes })
-
-    const dest = input.localDir ? resolve(input.localDir) : undefined
-    if (!dest) {
-      throw new RemoteError('no-local-dir', '不知道该拉回到哪个本地目录，请指定 localDir。')
-    }
-    await mkdir(dest, { recursive: true })
-
-    // Back up what is about to be overwritten.
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-    const backupDir = join(process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.dsh'), 'storages', 'dsh-remote-dispatch', 'backups')
-    await mkdir(backupDir, { recursive: true })
-    const backupTar = join(backupDir, `${project}-${stamp}.tar.gz`)
-
-    const tmpTar = join(tmpdir(), `_dshpull-${Date.now()}.tar.gz`)
-    const { runProcess } = await import('./ssh.js')
-
-    // Local pack of the current tree, best-effort.
+    await mkdir(localDir, { recursive: true })
+    const localTar = join(tmpdir(), `dsh-down-${stamp}.tar.gz`)
+    report({ phase: 'downloading', percent: 40, detail: `下载 ${(bytes / 1024 / 1024).toFixed(2)}MB` })
+    const dl = await t.downloadToFile(remoteTar, localTar, Math.max(this.settings.commandTimeoutMs, 600_000))
     try {
-      await runProcess('tar', ['-czf', backupTar, '-C', dest, '.'], {}, 300_000)
-    } catch {
-      // a missing backup must not block the pull
+      if (dl.code !== 0) {
+        throw new RemoteError('download-failed', (dl.stderr || '下载失败').trim().slice(0, 300))
+      }
+      report({ phase: 'unpacking', percent: 85, detail: '本地解包' })
+      const { runProcess } = await import('./ssh.js')
+      const unpack = await runProcess(
+        'tar',
+        ['-xzf', localTar, '-C', localDir, '--no-same-owner'],
+        {},
+        600_000,
+      )
+      if (unpack.code !== 0) {
+        throw new RemoteError('unpack-failed', (unpack.stderr || '解包失败').trim().slice(0, 300))
+      }
+      report({ phase: 'done', percent: 100, detail: '下载完成' })
+      return { host: hostName, project, remotePath, localDir, bytes }
+    } finally {
+      await rm(localTar, { force: true }).catch(() => {})
+      await t.exec(`rm -f ${shellQuote(remoteTar)}`).catch(() => {})
     }
+  }
 
-    report({ phase: 'downloading', percent: 15, detail: '下载中' })
-    const dl = await t.downloadToFile(remoteTar, tmpTar, Math.max(this.settings.commandTimeoutMs, 600_000))
-    if (dl.code !== 0) {
-      await rm(tmpTar, { force: true })
-      throw new RemoteError('download-failed', `下载失败：${(dl.stderr || '').trim().slice(0, 300)}`)
-    }
+  /** 列出某个项目下跑过的任务（按 meta.json 的工作目录过滤）。 */
+  async projectTasks(input) {
+    const hostName = (await this.resolveHost(input.host)).name
+    const t = await this.target(hostName)
+    const home = await this.home(hostName)
+    const root = `${home}/dsh-work`
+    const project = this.safeProject(input.project, undefined)
+    const projectDir = `${root}/${project}`
 
-    report({ phase: 'unpacking', percent: 85, detail: '本地解包' })
-    const unpack = await runProcess(
-      'tar',
-      ['-xzf', tmpTar, '-C', dest, '--no-same-owner'],
-      {},
-      600_000,
-    )
-    if (unpack.code !== 0) {
-      await rm(tmpTar, { force: true })
-      throw new RemoteError('unpack-failed', `解包失败：${(unpack.stderr || '').trim().slice(0, 300)}`)
-    }
-    await rm(tmpTar, { force: true })
-    await t.exec(`rm -f ${shellQuote(remoteTar)}`)
+    const cmd =
+      `for f in ${shellQuote(home)}/dsh-jobs/*/meta.json; do ` +
+      `[ -f "$f" ] || continue; ` +
+      `d=$(dirname "$f"); ` +
+      `w=$(sed -n 's/.*"workdir":"\\([^"]*\\)".*/\\1/p' "$f"); ` +
+      `[ "$w" = ${shellQuote(projectDir)} ] || continue; ` +
+      `s=$(cat "$d/status" 2>/dev/null); ` +
+      `t=$(sed -n 's/.*"submitted_at":"\\([^"]*\\)".*/\\1/p' "$f"); ` +
+      `echo "$(basename "$d")|$s|$t"; done`
 
-    report({ phase: 'done', percent: 100, detail: '同步完成' })
-    return {
-      host: hostName,
-      project,
-      remoteDir,
-      localDir: dest,
-      bytes: totalBytes,
-      backup: backupTar,
-      message: `已把 ${remoteDir} 拉回 ${dest}；覆盖前的本地内容备份在 ${backupTar}`,
+    const r = await t.exec(cmd)
+    const tasks = []
+    for (const line of (r.stdout || '').split(/\r?\n/)) {
+      const trimmed = line.trim()
+      if (trimmed === '') continue
+      const [jobId, state, submittedAt] = trimmed.split('|')
+      if (!jobId) continue
+      tasks.push({ jobId, state: state || 'unknown', submittedAt: submittedAt || '' })
     }
+    tasks.sort((a, b) => String(b.submittedAt).localeCompare(String(a.submittedAt)))
+    return { host: hostName, project, path: projectDir, count: tasks.length, tasks }
   }
 
   /**
@@ -1062,34 +1148,4 @@ export class RemoteDispatchService {
     }
     return out
   }
-}
-
-/**
- * Render the handoff document the cloud agent reads.
- *
- * Keeping the conversation in a file (instead of the task prompt) is what keeps
- * the prompt small: the agent reads what it needs, when it needs it.
- *
- * @param {object} session - result of resolveSession().
- */
-function renderTranscriptFile(session) {
-  return [
-    '# 本地会话交接记录',
-    '',
-    `- 会话 id：${session.sessionId}`,
-    `- 对话轮次：${session.turns}`,
-    `- 本地目录：${session.cwd}`,
-    `- 导出时间：${new Date().toISOString()}`,
-    session.truncated ? '- 注意：较早的轮次已省略，这里是最近的内容' : '',
-    '',
-    '> 这份文件是从本地 DSH 会话导出的。项目文件已同步到本目录，',
-    '> 需要细节时可以对照代码文件核对，不要只凭记忆。',
-    '',
-    '---',
-    '',
-    session.text,
-    '',
-  ]
-    .filter((line) => line !== null && line !== undefined)
-    .join('\n')
 }

@@ -1,8 +1,8 @@
 {
   "name": "dsh-remote-dispatch",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "把 DSH 任务派发到云端服务器执行：本地断网、关机都不影响云端继续跑，回来取结果。支持目录同步、会话续跑、多主机。",
+  "description": "在中控端直接管理云端 DSH：建项目、传文件、开任务、取结果，像本地一样操作。任务在云端独立进程执行，本地断网/关机不影响。",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -23,7 +23,9 @@
     "remote",
     "dispatch",
     "cloud",
-    "ssh"
+    "ssh",
+    "project",
+    "workspace"
   ],
   "license": "MIT",
   "author": "tragi",

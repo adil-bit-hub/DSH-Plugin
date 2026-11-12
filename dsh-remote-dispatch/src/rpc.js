@@ -67,6 +67,104 @@ function record(payload) {
  */
 export function registerRpc(web, service, settings) {
   const handlers = {
+    /** 云端项目列表（`~/dsh-work/*`）。 */
+    async projects(payload) {
+      const body = record(payload)
+      return await service.projects(typeof body.host === 'string' ? body.host : undefined)
+    },
+
+    /** 新建云端项目。 */
+    async createProject(payload) {
+      const body = record(payload)
+      if (typeof body.name !== 'string' || body.name.trim() === '') {
+        throw new RemoteError('invalid', '请提供项目名。')
+      }
+      return await service.createProject(body)
+    },
+
+    /** 删除云端项目（必须 confirm=true）。 */
+    async removeProject(payload) {
+      const body = record(payload)
+      if (typeof body.name !== 'string' || body.name.trim() === '') {
+        throw new RemoteError('invalid', '请提供项目名。')
+      }
+      return await service.removeProject(body)
+    },
+
+    /** 项目内文件列表。 */
+    async projectFiles(payload) {
+      const body = record(payload)
+      if (typeof body.project !== 'string' || body.project.trim() === '') {
+        throw new RemoteError('invalid', '请提供项目名。')
+      }
+      return await service.projectFiles(body)
+    },
+
+    /** 项目下跑过的任务。 */
+    async projectTasks(payload) {
+      const body = record(payload)
+      if (typeof body.project !== 'string' || body.project.trim() === '') {
+        throw new RemoteError('invalid', '请提供项目名。')
+      }
+      return await service.projectTasks(body)
+    },
+
+    /** 上传本地文件/目录到项目（NDJSON 进度流）。 */
+    async uploadToProject(payload, res) {
+      const body = record(payload)
+      res.writeHead(200, {
+        'content-type': 'application/x-ndjson; charset=utf-8',
+        'cache-control': 'no-store',
+        'x-accel-buffering': 'no',
+      })
+      const emit = (line) => {
+        try {
+          res.write(`${JSON.stringify(line)}\n`)
+        } catch {
+          // 浏览器断开也不影响云端的上传
+        }
+      }
+      try {
+        const result = await service.uploadToProject({
+          ...body,
+          onProgress: (progress) => emit({ type: 'progress', ...progress }),
+        })
+        emit({ type: 'done', result })
+      } catch (error) {
+        emit({ type: 'error', error: failure(error).error })
+      } finally {
+        res.end()
+      }
+    },
+
+    /** 从项目下载文件/目录到本地（NDJSON 进度流）。 */
+    async downloadFromProject(payload, res) {
+      const body = record(payload)
+      res.writeHead(200, {
+        'content-type': 'application/x-ndjson; charset=utf-8',
+        'cache-control': 'no-store',
+        'x-accel-buffering': 'no',
+      })
+      const emit = (line) => {
+        try {
+          res.write(`${JSON.stringify(line)}\n`)
+        } catch {
+          // ignore
+        }
+      }
+      try {
+        const result = await service.downloadFromProject({
+          ...body,
+          onProgress: (progress) => emit({ type: 'progress', ...progress }),
+        })
+        emit({ type: 'done', result })
+      } catch (error) {
+        emit({ type: 'error', error: failure(error).error })
+      } finally {
+        res.end()
+      }
+    },
+
     /** Devices + defaults. Never includes a secret. */
     async hosts() {
       const { defaultDevice, devices } = await service.registry.list()
@@ -174,107 +272,6 @@ export function registerRpc(web, service, settings) {
       }
     },
 
-    /**
-     * Candidate sessions to hand off. The user picks one; the plugin cannot know
-     * which conversation is on screen.
-     */
-    async sessions(payload) {
-      const { listRecentSessions } = await import('./sessions.js')
-      const home = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== ''
-        ? process.env.DSH_HOME
-        : join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.dsh')
-      const body = record(payload)
-      const list = await listRecentSessions(join(home, 'sessions'), {
-        limit: Number(body.limit) || 12,
-      })
-      return { sessions: list }
-    },
-
-    /**
-     * What the panel shows before pushing: which session would travel, how much
-     * of it, and which local project directory is attached.
-     */
-    async sessionInfo(payload) {
-      const body = record(payload)
-      const session = await service.resolveSession(
-        typeof body.sessionId === 'string' && body.sessionId !== '' ? body.sessionId : undefined,
-      )
-      return {
-        sessionId: session.sessionId,
-        turns: session.turns,
-        transcriptChars: session.text.length,
-        truncated: session.truncated,
-        localDir: session.cwd,
-        project: basename(session.cwd || '') || 'session',
-        fileCount: (session.files ?? []).length,
-        sampleFiles: (session.files ?? []).slice(0, 6),
-      }
-    },
-
-    /**
-     * Push the whole conversation plus its project files, streaming progress.
-     * This is the 「整段对话 + 项目文件」 path the composer button uses.
-     */
-    async pushSession(payload, res) {
-      const body = record(payload)
-      res.writeHead(200, {
-        'content-type': 'application/x-ndjson; charset=utf-8',
-        'cache-control': 'no-store',
-        'x-accel-buffering': 'no',
-      })
-      const emit = (line) => {
-        try {
-          res.write(`${JSON.stringify(line)}\n`)
-        } catch {
-          // the browser left; the dispatch keeps running
-        }
-      }
-      try {
-        const result = await service.dispatchSession({
-          sessionId: typeof body.sessionId === 'string' && body.sessionId !== '' ? body.sessionId : undefined,
-          instruction: typeof body.instruction === 'string' ? body.instruction : undefined,
-          host: typeof body.host === 'string' ? body.host : undefined,
-          project: typeof body.project === 'string' ? body.project : undefined,
-          syncFiles: body.syncFiles !== false,
-          onProgress: (progress) => emit({ type: 'progress', ...progress }),
-        })
-        emit({ type: 'done', result })
-      } catch (error) {
-        emit({ type: 'error', error: failure(error).error })
-      } finally {
-        res.end()
-      }
-    },
-
-    /** Pull the cloud working directory back over the local project. */
-    async pull(payload, res) {
-      const body = record(payload)
-      res.writeHead(200, {
-        'content-type': 'application/x-ndjson; charset=utf-8',
-        'cache-control': 'no-store',
-        'x-accel-buffering': 'no',
-      })
-      const emit = (line) => {
-        try {
-          res.write(`${JSON.stringify(line)}\n`)
-        } catch {
-          // ignore
-        }
-      }
-      try {
-        const result = await service.pull({
-          host: typeof body.host === 'string' ? body.host : undefined,
-          project: body.project,
-          localDir: typeof body.localDir === 'string' ? body.localDir : undefined,
-          onProgress: (progress) => emit({ type: 'progress', ...progress }),
-        })
-        emit({ type: 'done', result })
-      } catch (error) {
-        emit({ type: 'error', error: failure(error).error })
-      } finally {
-        res.end()
-      }
-    },
 
     async status(payload) {
       const { jobId, host } = record(payload)
@@ -306,7 +303,7 @@ export function registerRpc(web, service, settings) {
     },
   }
 
-  const STREAMING = new Set(['push', 'pushSession', 'pull'])
+  const STREAMING = new Set(['push', 'uploadToProject', 'downloadFromProject'])
 
   const handler = async (req, res) => {
     let admission
