@@ -270,6 +270,19 @@ export function registerTools(ctx, service, settings) {
   })
 
   ctx.tools.register({
+    name: 'remote_console',
+    description:
+      '打开某台云端设备自带的 DSH 控制台：在本机建一条 SSH 隧道到云端 Web 端口，返回可直接打开的本地地址（含 token）。' +
+      '适合想用云端原生界面时使用；看我们派发的任务执行过程则用执行视图 / remote_logs。',
+    parameters: {
+      type: 'object',
+      properties: { host: HOST_ARG },
+    },
+    output: { schema: {}, render: JSON_RENDER },
+    execute: wrap(async (args) => service.remoteConsole(args)),
+  })
+
+  ctx.tools.register({
     name: 'remote_cancel',
     description: '取消云端任务（杀掉整个进程组）。',
     parameters: {

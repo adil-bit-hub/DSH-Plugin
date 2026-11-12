@@ -940,6 +940,197 @@ export class RemoteDispatchService {
     }
   }
 
+  /**
+   * 打开云端 DSH 控制台：本机建一条 SSH 隧道到云端的 Web 端口，
+   * 返回可以直接打开的本地地址（带 token），于是两台云端的界面都能像本地一样用。
+   *
+   * 只建隧道，不做代理：浏览器直连本机端口，Host 用 loopback，云端接受。
+   */
+  async remoteConsole(input) {
+    const hostName = (await this.resolveHost(input.host)).name
+    const t = await this.target(hostName)
+    const home = await this.home(hostName)
+
+    // 1) 一次探测拿全：systemd 参数（有单元时）、监听端口、web-url.txt、日志里的 token
+    //    两台机器情况不同：阿里云走 systemd，腾讯云是手动拉起的进程，只有 web-url.txt。
+    const probe = await t.exec(
+      [
+        `systemctl show dsh-web -p ExecStart --value 2>/dev/null || true`,
+        `echo "---EXEC---"`,
+        `ss -tln 2>/dev/null | grep -oE '(127\\.0\\.0\\.1|0\\.0\\.0\\.0):[0-9]+' | sort -u || true`,
+        `echo "---PORTS---"`,
+        `cat ${shellQuote(`${home}/.dsh/web-url.txt`)} 2>/dev/null || true`,
+        `echo`,
+        `echo "---URL---"`,
+        `(journalctl -u dsh-web --no-pager 2>/dev/null | grep -oE 'token=[A-Za-z0-9_-]+' | tail -1) || true`,
+        `echo "---TOK---"`,
+      ].join('\n'),
+    )
+    const out = probe.stdout || ''
+    const between = (a, b) => {
+      const i = out.indexOf(a)
+      const j = out.indexOf(b)
+      return i >= 0 && j > i ? out.slice(i + a.length, j).trim() : ''
+    }
+
+    const execLine = between('', '---EXEC---')
+    const portsText = between('---EXEC---', '---PORTS---')
+    const urlText = between('---PORTS---', '---URL---')
+    const tokText = between('---URL---', '---TOK---')
+
+    const execPort = (execLine.match(/--port\s+(\d+)/) || [])[1]
+    const urlPort = (urlText.match(/:(\d{2,5})\//) || [])[1]
+    const remotePort = Number(execPort || urlPort || 3080)
+
+    const listening = portsText.includes(`:${remotePort}`)
+    if (!listening) {
+      throw new RemoteError(
+        'web-not-running',
+        `云端 ${hostName} 的 DSH Web 没在监听 ${remotePort}。先在那台机器上启动它（systemctl start dsh-web，或按原有方式拉起）。`,
+      )
+    }
+
+    // 2) 访问 token：web-url.txt 优先，其次 systemd 日志
+    const token = (urlText.match(/token=([A-Za-z0-9_-]+)/) || tokText.match(/token=([A-Za-z0-9_-]+)/) || [])[1]
+    if (!token) {
+      throw new RemoteError(
+        'no-token',
+        `取不到 ${hostName} 的访问 token。可以看 ${home}/.dsh/web-url.txt，或 journalctl -u dsh-web | grep token | tail -1`,
+      )
+    }
+
+    // 3) 复用已有隧道，或新建一条
+    const key = `${hostName}:${remotePort}`
+    let tunnel = this.tunnels?.get(key)
+    if (!tunnel || tunnel.child.exitCode !== null) {
+      const port = await this.pickLocalPort()
+      const spawned = await t.spawnTunnel(port, remotePort)
+      try {
+        await spawned.ready()
+      } finally {
+        await spawned.cleanupAuth()
+      }
+      tunnel = { child: spawned.child, port, remotePort, stderr: () => spawned.stderr }
+      this.tunnels = this.tunnels ?? new Map()
+      this.tunnels.set(key, tunnel)
+      // 进程自己退出后从表里摘掉
+      spawned.child.on('close', () => {
+        try { this.tunnels.delete(key) } catch { /* ignore */ }
+      })
+    }
+
+    const url = `http://127.0.0.1:${tunnel.port}/?token=${token}`
+    return {
+      host: hostName,
+      url,
+      port: tunnel.port,
+      remotePort,
+      message: `已建立隧道 → ${url}`,
+    }
+  }
+
+  /** 关掉某台设备的控制台隧道。 */
+  async closeConsole(input) {
+    const hostName = (await this.resolveHost(input.host)).name
+    let closed = 0
+    if (this.tunnels) {
+      for (const [key, tunnel] of [...this.tunnels.entries()]) {
+        if (!key.startsWith(`${hostName}:`)) continue
+        try { tunnel.child.kill() } catch { /* ignore */ }
+        this.tunnels.delete(key)
+        closed += 1
+      }
+    }
+    return { host: hostName, closed }
+  }
+
+  /** 插件卸载/停用时清理所有隧道。 */
+  disposeTunnels() {
+    if (!this.tunnels) return 0
+    let n = 0
+    for (const tunnel of this.tunnels.values()) {
+      try { tunnel.child.kill() } catch { /* ignore */ }
+      n += 1
+    }
+    this.tunnels.clear()
+    return n
+  }
+
+  /** 找一个空闲的本机端口。 */
+  async pickLocalPort() {
+    const net = await import('node:net')
+    return await new Promise((resolvePort, reject) => {
+      const srv = net.createServer()
+      srv.once('error', reject)
+      srv.listen(0, '127.0.0.1', () => {
+        const port = srv.address().port
+        srv.close(() => resolvePort(port))
+      })
+    })
+  }
+
+  /**
+   * 读取任务执行事件（增量）。
+   *
+   * 云端任务的 `events.jsonl` 就是 `dsh headless --json` 的事件流：thinking /
+   * tool_call / tool_result / status / final。按字节偏移增量拉取，就能在面板里
+   * 还原"本地看它一步步干活"的效果，不需要内嵌云端 Web 页面（那里也看不到这些
+   * headless 任务）。
+   *
+   * @param {object} input - { host, jobId, offset, limit }
+   * @returns {Promise<{jobId,state,size,nextOffset,events:Array}>}
+   */
+  async taskEvents(input) {
+    const hostName = (await this.resolveHost(input.host)).name
+    const t = await this.target(hostName)
+    const home = await this.home(hostName)
+    const jobId = this.validateJobId(input.jobId)
+    const dir = `${home}/dsh-jobs/${jobId}`
+    const offset = Math.max(0, Number(input.offset) || 0)
+    const limit = Math.max(1024, Math.min(400_000, Number(input.limit) || 200_000))
+
+    const cmd = [
+      `f=${shellQuote(`${dir}/events.jsonl`)}`,
+      '[ -f "$f" ] || { echo "__MISSING__"; exit 3; }',
+      'echo "__SIZE__$(wc -c < "$f")"',
+      `echo "__STATE__$(cat ${shellQuote(`${dir}/status`)} 2>/dev/null)"`,
+      `tail -c +${offset + 1} "$f" | head -c ${limit}`,
+    ].join('\n')
+
+    const r = await t.exec(cmd)
+    if (r.stdout.includes('__MISSING__')) {
+      throw new RemoteError('job-not-found', `云端没有任务 ${jobId} 的事件流。`)
+    }
+
+    const out = r.stdout || ''
+    const sizeMatch = out.match(/__SIZE__(\d+)/)
+    const stateMatch = out.match(/__STATE__(\S*)/)
+    const size = sizeMatch ? Number(sizeMatch[1]) : 0
+    const state = stateMatch && stateMatch[1] ? stateMatch[1] : 'unknown'
+
+    // 去掉两行元信息，剩下是事件正文
+    const bodyStart = out.indexOf('\n', out.indexOf('__STATE__'))
+    const chunk = bodyStart >= 0 ? out.slice(bodyStart + 1) : ''
+
+    // 只消费完整行；末尾不完整的半行留到下次
+    const lastNewline = chunk.lastIndexOf('\n')
+    const complete = lastNewline >= 0 ? chunk.slice(0, lastNewline + 1) : ''
+    const nextOffset = offset + Buffer.byteLength(complete, 'utf8')
+
+    const events = []
+    for (const line of complete.split('\n')) {
+      const trimmed = line.trim()
+      if (trimmed === '') continue
+      try {
+        events.push(JSON.parse(trimmed))
+      } catch {
+        // 坏行跳过
+      }
+    }
+
+    return { host: hostName, jobId, state, size, nextOffset, events }
+  }
+
   /** 列出某个项目下跑过的任务（按 meta.json 的工作目录过滤）。 */
   async projectTasks(input) {
     const hostName = (await this.resolveHost(input.host)).name

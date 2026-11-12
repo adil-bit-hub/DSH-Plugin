@@ -165,6 +165,18 @@ export function registerRpc(web, service, settings) {
       }
     },
 
+    /** 打开云端 DSH 控制台：建 SSH 隧道，返回可直接打开的本地地址。 */
+    async console(payload) {
+      const body = record(payload)
+      return await service.remoteConsole(body)
+    },
+
+    /** 关闭控制台隧道。 */
+    async consoleClose(payload) {
+      const body = record(payload)
+      return await service.closeConsole(body)
+    },
+
     /** Devices + defaults. Never includes a secret. */
     async hosts() {
       const { defaultDevice, devices } = await service.registry.list()

@@ -112,5 +112,14 @@ export function apply(ctx, config) {
     }
   }
 
+  // 停用/卸载插件时把控制台隧道一起收掉，避免留下 ssh 进程
+  ctx.effect(() => () => {
+    try {
+      service.disposeTunnels()
+    } catch {
+      // 清理失败不影响卸载
+    }
+  }, 'remote-dispatch: close console tunnels')
+
   ctx.logger?.info?.(`remote-dispatch: ready (${Object.keys(settings.hosts).length} host(s))`)
 }

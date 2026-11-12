@@ -405,6 +405,63 @@ export class SshTarget {
     }
   }
 
+  /**
+   * 开一条本地端口到远端端口的隧道（等价 `ssh -N -L`）。
+   *
+   * 返回子进程和"等端口可用"的方法；调用方负责在不用时 kill。
+   * 凭据沿用同一套 askpass/临时私钥，不落命令行。
+   *
+   * @param {number} localPort - 本机端口
+   * @param {number} remotePort - 远端端口（通常是云端 DSH Web 的端口）
+   */
+  async spawnTunnel(localPort, remotePort) {
+    const auth = await this.auth()
+    const args = await this.baseArgs([...auth.extraArgs, '-N', '-L', `127.0.0.1:${localPort}:127.0.0.1:${remotePort}`])
+
+    const child = spawn('ssh', args, { env: auth.env, windowsHide: true, shell: false })
+
+    let stderr = ''
+    child.stderr?.on('data', (chunk) => {
+      if (stderr.length < 4000) stderr += chunk.toString('utf8')
+    })
+
+    const exited = new Promise((resolve) => {
+      child.on('close', (code) => resolve(code ?? 0))
+      child.on('error', () => resolve(-1))
+    })
+
+    // 等端口真正能连上（ssh 起来到转发可用有几毫秒到几百毫秒）
+    const ready = async (timeoutMs = 15_000) => {
+      const deadline = Date.now() + timeoutMs
+      const net = await import('node:net')
+      while (Date.now() < deadline) {
+        if (child.exitCode !== null) {
+          throw new RemoteError('tunnel-failed', `SSH 隧道退出：${stderr.trim().slice(0, 300) || `code ${child.exitCode}`}`)
+        }
+        const ok = await new Promise((resolve) => {
+          const socket = net.connect({ host: '127.0.0.1', port: localPort })
+          socket.once('connect', () => { socket.destroy(); resolve(true) })
+          socket.once('error', () => { socket.destroy(); resolve(false) })
+          setTimeout(() => { socket.destroy(); resolve(false) }, 800)
+        })
+        if (ok) return true
+        await new Promise((r) => setTimeout(r, 200))
+      }
+      throw new RemoteError('tunnel-timeout', `隧道 ${localPort} → ${remotePort} 未就绪：${stderr.trim().slice(0, 300)}`)
+    }
+
+    return {
+      child,
+      ready,
+      exited,
+      // 隧道建好后才能清理临时私钥；失败也要清理
+      cleanupAuth: () => Promise.all(auth.cleanup.map((fn) => fn().catch(() => {}))),
+      get stderr() {
+        return stderr
+      },
+    }
+  }
+
   /** Copy a remote file back as a Buffer. */
   async download(remotePath, timeoutMs) {
     const auth = await this.auth()

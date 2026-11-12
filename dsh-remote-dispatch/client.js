@@ -149,6 +149,20 @@ window.__ModuleLoader__.load({
 .drd-sessionPath { margin-top: 3px; color: var(--dsw-alias-label-secondary, #8a9099); font-size: 11px; font-family: ui-monospace, Consolas, monospace; word-break: break-all; }
 .drd-check { display: flex; align-items: center; gap: 7px; font-size: 12.5px; cursor: pointer; margin-top: 4px; }
 .drd-check input { width: 14px; height: 14px; accent-color: #2563eb; cursor: pointer; }
+.drd-viewer { margin-top: 10px; border: 1px solid var(--dsw-alias-line-regular, #e3e5e8); border-radius: 10px; overflow: hidden; background: var(--dsw-alias-bg-primary, #fff); }
+.drd-viewerHead { display: flex; align-items: center; gap: 8px; padding: 7px 9px; background: var(--dsw-alias-bg-secondary, #f7f8fa); border-bottom: 1px solid var(--dsw-alias-line-regular, #eceef1); }
+.drd-viewerTitle { font-weight: 650; font-size: 12.5px; }
+.drd-viewerBody { max-height: 320px; overflow: auto; padding: 6px 8px; }
+.drd-ev { padding: 3px 0; font-size: 11.5px; line-height: 16px; }
+.drd-evHead { display: flex; gap: 5px; align-items: baseline; cursor: pointer; }
+.drd-evHint { color: var(--dsw-alias-label-secondary, #8a9099); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.drd-evName { font-weight: 600; color: #1d4ed8; }
+.drd-evBody { margin: 4px 0 6px; padding: 6px 8px; border-radius: 6px; background: var(--dsw-alias-bg-secondary, #f7f8fa); white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow: auto; font-family: ui-monospace, Consolas, monospace; font-size: 11px; line-height: 15px; }
+.drd-evThink .drd-evHead { color: #6b7280; }
+.drd-evTool .drd-evHead { color: #1d4ed8; }
+.drd-evResult .drd-evHead { color: #047857; }
+.drd-evStatus { color: var(--dsw-alias-label-secondary, #a0a5ad); font-size: 10.5px; }
+.drd-evFinal .drd-evHead { color: #047857; font-weight: 650; }
 `
 
     let styleInstalled = false
@@ -268,6 +282,162 @@ window.__ModuleLoader__.load({
     // ---------------------------------------------------------------- panel
 
 /**
+     * 任务执行视图：把云端 `events.jsonl` 增量拉回来，还原"本地看它干活"的体验。
+     *
+     * 事件类型：thinking / tool_call / tool_result / status / final。
+     * 轮询式增量拉取（按字节偏移），不需要内嵌云端 Web 页面，也不受断网影响。
+     */
+    function TaskViewer(props) {
+      const { host, jobId, onClose } = props
+      const [events, setEvents] = React.useState([])
+      const [state, setState] = React.useState('unknown')
+      const [error, setError] = React.useState('')
+      const [expanded, setExpanded] = React.useState({})
+      const offsetRef = React.useRef(0)
+      const aliveRef = React.useRef(true)
+      const boxRef = React.useRef(null)
+
+      React.useEffect(() => {
+        aliveRef.current = true
+        offsetRef.current = 0
+        setEvents([])
+        setState('unknown')
+        setError('')
+
+        let timer = null
+
+        const poll = async () => {
+          if (!aliveRef.current) return
+          try {
+            const value = await callRpc('taskEvents', { host, jobId, offset: offsetRef.current })
+            if (!aliveRef.current) return
+            offsetRef.current = value.nextOffset
+            setState(value.state)
+            if (value.events && value.events.length > 0) {
+              setEvents((prev) => prev.concat(value.events).slice(-400))
+            }
+            const finished = ['done', 'failed', 'cancelled'].includes(value.state)
+            const caughtUp = value.nextOffset >= value.size
+            if (!(finished && caughtUp)) {
+              timer = setTimeout(poll, 1500)
+            }
+          } catch (err) {
+            if (!aliveRef.current) return
+            setError(err.message)
+            timer = setTimeout(poll, 3000)
+          }
+        }
+
+        poll()
+        return () => {
+          aliveRef.current = false
+          if (timer) clearTimeout(timer)
+        }
+      }, [host, jobId])
+
+      // 有新事件时贴底
+      React.useEffect(() => {
+        const box = boxRef.current
+        if (box) box.scrollTop = box.scrollHeight
+      }, [events.length])
+
+      const toggle = (key) => setExpanded((prev) => ({ ...prev, [key]: !prev[key] }))
+
+      const firstLine = (text, max) => {
+        const line = String(text || '').split('\n')[0]
+        return line.length > max ? `${line.slice(0, max)}…` : line
+      }
+
+      const renderEvent = (event, index) => {
+        const key = `${event.type}-${index}`
+
+        if (event.type === 'thinking') {
+          const open = expanded[key]
+          return h(
+            'div',
+            { key, className: 'drd-ev drd-evThink' },
+            h('div', { className: 'drd-evHead', onClick: () => toggle(key) },
+              h('span', null, open ? '▾' : '▸'),
+              h('span', null, '思考'),
+              open ? null : h('span', { className: 'drd-evHint' }, firstLine(event.text, 60))),
+            open ? h('pre', { className: 'drd-evBody' }, event.text) : null,
+          )
+        }
+
+        if (event.type === 'tool_call') {
+          const open = expanded[key]
+          const input = event.input || {}
+          const summary = input.command || input.description || input.path || input.task || JSON.stringify(input)
+          return h(
+            'div',
+            { key, className: 'drd-ev drd-evTool' },
+            h('div', { className: 'drd-evHead', onClick: () => toggle(key) },
+              h('span', null, open ? '▾' : '▸'),
+              h('span', { className: 'drd-evName' }, event.tool || 'tool'),
+              h('span', { className: 'drd-evHint' }, firstLine(summary, 70))),
+            open ? h('pre', { className: 'drd-evBody' }, JSON.stringify(input, null, 2)) : null,
+          )
+        }
+
+        if (event.type === 'tool_result') {
+          const open = expanded[key]
+          const text = typeof event.result === 'string' ? event.result : JSON.stringify(event.result)
+          return h(
+            'div',
+            { key, className: 'drd-ev drd-evResult' },
+            h('div', { className: 'drd-evHead', onClick: () => toggle(key) },
+              h('span', null, open ? '▾' : '▸'),
+              h('span', null, event.status === 'completed' ? '结果' : `结果(${event.status || '?'})`),
+              open ? null : h('span', { className: 'drd-evHint' }, firstLine(text, 70))),
+            open ? h('pre', { className: 'drd-evBody' }, String(text).slice(0, 8000)) : null,
+          )
+        }
+
+        if (event.type === 'final') {
+          return h('div', { key, className: 'drd-ev drd-evFinal' },
+            h('div', { className: 'drd-evHead' }, h('span', null, '最终答复')),
+            h('pre', { className: 'drd-evBody' }, event.text || ''))
+        }
+
+        if (event.type === 'status') {
+          return h('div', { key, className: 'drd-ev drd-evStatus' },
+            h('span', null, `${event.phase || ''}${event.turn ? ` · 第 ${event.turn} 轮` : ''}${event.step ? ` · 第 ${event.step} 步` : ''}`))
+        }
+
+        if (event.type === 'session') {
+          return h('div', { key, className: 'drd-ev drd-evStatus' },
+            h('span', null, `会话 ${String(event.sessionId || '').slice(0, 20)} · ${event.cwd || ''}`))
+        }
+
+        return null
+      }
+
+      const badge = state === 'done' ? 'drd-tag drd-tagOk' : state === 'failed' ? 'drd-tag drd-tagBad' : 'drd-tag'
+      const live = !['done', 'failed', 'cancelled'].includes(state)
+
+      return h(
+        'div',
+        { className: 'drd-viewer' },
+        h(
+          'div',
+          { className: 'drd-viewerHead' },
+          h('span', { className: 'drd-viewerTitle' }, '执行情况'),
+          h('span', { className: badge }, live ? '运行中' : state),
+          h('span', { className: 'drd-evHint' }, `${events.length} 条事件`),
+          h('button', { type: 'button', className: 'drd-mini', onClick: onClose }, '关闭'),
+        ),
+        error ? h('div', { className: 'drd-msg drd-msgErr' }, error) : null,
+        h(
+          'div',
+          { className: 'drd-viewerBody', ref: boxRef },
+          events.length === 0
+            ? h('div', { className: 'drd-evHint' }, live ? '等待云端产生事件…' : '没有事件记录')
+            : events.map(renderEvent),
+        ),
+      )
+    }
+
+/**
      * 输入框旁的「云端」按钮。
      *
      * 像在本地一样操作云端：选设备 → 选/建项目 → 写任务 → 发送。
@@ -287,6 +457,7 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = React.useState('')
       const [error, setError] = React.useState('')
       const [job, setJob] = React.useState(null)
+      const [viewJob, setViewJob] = React.useState(null)
       const rootRef = React.useRef(null)
       const taskRef = React.useRef(null)
 
@@ -504,7 +675,16 @@ window.__ModuleLoader__.load({
                     h('div', null, '任务已提交，本地断网也不影响。'),
                     h('div', { className: 'drd-job' }, job.jobId),
                     h('div', null, `${job.host} · ${job.remoteRoot}`),
+                    h('div', { className: 'drd-banner' },
+                      h('span', null, '想看它一步步在干什么：'),
+                      h('button', {
+                        type: 'button', className: 'drd-mini',
+                        onClick: () => setViewJob(job.jobId === viewJob ? null : job.jobId),
+                      }, viewJob === job.jobId ? '收起执行' : '查看执行')),
                   )
+                : null,
+              viewJob && job
+                ? h(TaskViewer, { host: job.host || device, jobId: viewJob, onClose: () => setViewJob(null) })
                 : null,
               error ? h('div', { className: 'drd-msg drd-msgErr' }, error) : null,
 
@@ -666,6 +846,7 @@ window.__ModuleLoader__.load({
       const [taskText, setTaskText] = React.useState('')
       const [starting, setStarting] = React.useState(false)
       const [taskResult, setTaskResult] = React.useState(null)
+      const [viewJob, setViewJob] = React.useState(null)
       const [localDir, setLocalDir] = React.useState('')
 
       React.useEffect(() => {
@@ -970,6 +1151,10 @@ window.__ModuleLoader__.load({
                     taskResult.text ? h('pre', { className: 'drd-pre' }, taskResult.text) : h('div', null, '任务已提交，稍后点「结果」查看。'))
                 : null,
 
+              viewJob
+                ? h(TaskViewer, { host: device, jobId: viewJob, onClose: () => setViewJob(null) })
+                : null,
+
               // 任务列表
               tasks.length > 0
                 ? h(
@@ -984,6 +1169,10 @@ window.__ModuleLoader__.load({
                           h('div', { className: 'drd-rowName' }, t.jobId,
                             h('span', { className: t.state === 'done' ? 'drd-tag drd-tagOk' : t.state === 'failed' ? 'drd-tag drd-tagBad' : 'drd-tag' }, t.state)),
                           h('div', { className: 'drd-rowMeta' }, t.submittedAt || '')),
+                        h('button', {
+                          type: 'button', className: 'drd-mini',
+                          onClick: () => setViewJob(t.jobId === viewJob ? null : t.jobId),
+                        }, viewJob === t.jobId ? '收起' : '执行情况'),
                         h('button', { type: 'button', className: 'drd-mini', onClick: () => showResult(t.jobId) }, '结果'),
                       ),
                     ),
@@ -1001,6 +1190,7 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = React.useState('')
       const [probes, setProbes] = React.useState({})
       const [form, setForm] = React.useState({ name: '', label: '', credentialId: '', workRoot: '', note: '', editing: false })
+      const [consoleBusy, setConsoleBusy] = React.useState('')
 
       const refresh = React.useCallback(async () => {
         setError('')
@@ -1035,6 +1225,22 @@ window.__ModuleLoader__.load({
           setError(err.message)
         } finally {
           setBusy(false)
+        }
+      }
+
+      // 打开云端 DSH 控制台：建隧道后在新标签页打开
+      const openConsole = async (name) => {
+        setConsoleBusy(name)
+        setError('')
+        setNotice('')
+        try {
+          const value = await callRpc('console', { host: name })
+          window.open(value.url, '_blank', 'noopener')
+          setNotice(`已打开 ${name} 的控制台：${value.url}`)
+        } catch (err) {
+          setError(`打开控制台失败：${err.message}`)
+        } finally {
+          setConsoleBusy('')
         }
       }
 
@@ -1123,6 +1329,12 @@ window.__ModuleLoader__.load({
                         ? h('div', { className: 'drd-rowMeta drd-bad' }, probe.error)
                         : null,
                     ),
+                    h('button', {
+                      type: 'button', className: 'drd-mini',
+                      onClick: () => openConsole(device.name),
+                      disabled: busy || consoleBusy === device.name,
+                      title: '通过 SSH 隧道打开该设备的 DSH 控制台',
+                    }, consoleBusy === device.name ? '打开中…' : '控制台'),
                     h('button', { type: 'button', className: 'drd-mini', onClick: () => doProbe(device.name), disabled: busy || !!probe?.testing }, '检测'),
                     device.name === state.defaultDevice
                       ? null
