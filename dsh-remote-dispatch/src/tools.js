@@ -185,40 +185,88 @@ export function registerTools(ctx, service, settings) {
   })
 
   ctx.tools.register({
-    name: 'remote_push_session',
+    name: 'remote_projects',
     description:
-      '把「当前进行中的这段对话」整体搬到云端继续：整段对话以文字记录随任务下发，本会话所在的项目目录自动打包上传，' +
-      '云端带着完整上下文接着干。适合任务很长、即将断网/关机、或希望挂机跑完时使用。' +
-      '完成后可用 remote_pull 把云端改动同步回本地。',
+      '管理云端的「项目」（云端就是 ~/dsh-work/<项目名> 目录）。' +
+      'list=列出所有项目（文件数/体积/更新时间）；create=新建空项目；remove=删除项目（需 confirm=true）；' +
+      'files=列出项目内文件；tasks=列出该项目跑过的任务。用来像本地一样操作两台云端 DSH。',
     parameters: {
       type: 'object',
       properties: {
-        instruction: { type: 'string', description: '希望云端接着做什么；留空则让它继续完成最后一件未完成的事。' },
+        action: { type: 'string', enum: ['list', 'create', 'remove', 'files', 'tasks'], description: '要执行的操作。' },
         host: HOST_ARG,
-        project: { type: 'string', description: '云端项目名（工作目录），默认用本地目录名。' },
-        syncFiles: { type: 'boolean', description: '是否同步本会话的项目文件，默认 true。' },
-        sessionId: { type: 'string', description: '可选：指定会话 id；省略则自动取本机最近活动的会话。' },
+        project: { type: 'string', description: '项目名（create/remove/files/tasks 必填）。' },
+        confirm: { type: 'boolean', description: 'remove 时必须显式传 true。' },
+        depth: { type: 'number', description: 'files 时的目录深度，默认 3。' },
       },
+      required: ['action'],
     },
     output: { schema: {}, render: JSON_RENDER },
-    execute: wrap(async (args) => service.dispatchSession(args)),
+    execute: wrap(async (args) => {
+      const action = String(args.action ?? 'list')
+      if (action === 'list') return await service.projects(args.host)
+      if (action === 'create') return await service.createProject({ host: args.host, name: args.project })
+      if (action === 'remove') return await service.removeProject({ host: args.host, name: args.project, confirm: args.confirm === true })
+      if (action === 'files') return await service.projectFiles({ host: args.host, project: args.project, depth: args.depth })
+      if (action === 'tasks') return await service.projectTasks({ host: args.host, project: args.project })
+      throw new Error(`未知 action：${action}`)
+    }),
   })
 
   ctx.tools.register({
-    name: 'remote_pull',
+    name: 'remote_upload',
     description:
-      '把云端项目目录的改动拉回本地，覆盖前会先备份本地内容。用于「两边同步」：云端跑完后把结果文件取回来。',
+      '把本地文件或目录上传到云端项目（可指定项目内子目录）。只上传你指定的这一项，不会搬整个目录。' +
+      '上传后可在该项目里用 remote_task 开任务或 remote_dispatch 派发。',
     parameters: {
       type: 'object',
       properties: {
-        project: { type: 'string', description: '云端项目名（与推送时一致）。' },
-        localDir: { type: 'string', description: '本地目标目录，默认沿用该项目的本地路径。' },
+        project: { type: 'string', description: '目标项目名（不存在会自动创建目录）。' },
+        localPath: { type: 'string', description: '本地文件或目录的绝对路径。' },
+        subdir: { type: 'string', description: '项目内的子目录，可留空表示项目根。' },
         host: HOST_ARG,
       },
-      required: ['project'],
+      required: ['project', 'localPath'],
     },
     output: { schema: {}, render: JSON_RENDER },
-    execute: wrap(async (args) => service.pull(args)),
+    execute: wrap(async (args) => service.uploadToProject(args)),
+  })
+
+  ctx.tools.register({
+    name: 'remote_download',
+    description: '把云端项目里的文件或目录下载到本地指定目录。',
+    parameters: {
+      type: 'object',
+      properties: {
+        project: { type: 'string', description: '项目名。' },
+        remotePath: { type: 'string', description: '项目内的相对路径，例如 src/main.py。' },
+        localDir: { type: 'string', description: '本地落地目录（绝对路径）。' },
+        host: HOST_ARG,
+      },
+      required: ['project', 'remotePath', 'localDir'],
+    },
+    output: { schema: {}, render: JSON_RENDER },
+    execute: wrap(async (args) => service.downloadFromProject(args)),
+  })
+
+  ctx.tools.register({
+    name: 'remote_task',
+    description:
+      '在指定的云端项目目录里开一个任务（不需要上传任何东西，直接用该项目已有的文件）。' +
+      '返回 jobId，之后用 remote_status / remote_result 取结果。',
+    parameters: {
+      type: 'object',
+      properties: {
+        project: { type: 'string', description: '项目名（即云端工作目录名）。' },
+        task: { type: 'string', description: '让云端在这个项目里做什么。' },
+        host: HOST_ARG,
+      },
+      required: ['project', 'task'],
+    },
+    output: { schema: {}, render: JSON_RENDER },
+    execute: wrap(async (args) =>
+      service.dispatch({ host: args.host, project: args.project, task: args.task }),
+    ),
   })
 
   ctx.tools.register({
