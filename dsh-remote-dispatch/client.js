@@ -183,9 +183,13 @@ window.__ModuleLoader__.load({
           const message = body && body.error && body.error.message ? body.error.message : `HTTP ${response.status}`
           throw new Error(message)
         }
-        if (!body || body.ok !== true) {
-          const error = body && body.error ? body.error : {}
-          throw new Error(error.message || `请求 ${endpoint} 失败`)
+        if (body === null) {
+          // 流式接口（push / upload / download）不能用 callRpc，会走到这里
+          throw new Error(`${endpoint} 返回了非 JSON 响应（HTTP ${response.status}）——该接口是流式的，应使用 streamRpc`)
+        }
+        if (body.ok !== true) {
+          const error = body.error ? body.error : {}
+          throw new Error(error.message || `${endpoint} 失败：${error.code || '未知错误'}`)
         }
         return body.value
       })
@@ -228,6 +232,29 @@ window.__ModuleLoader__.load({
           // ignore
         }
       }
+    }
+
+    /**
+     * 跑一个流式接口直到结束，返回最终 result。
+     *
+     * push / uploadToProject / downloadFromProject 都是 NDJSON 流，不能用普通
+     * callRpc（它会当 JSON 解析，结果就是一句没头没尾的“请求失败”）。
+     */
+    async function streamUntilDone(endpoint, payload, onProgress) {
+      let result
+      let failure
+      await streamRpc(endpoint, payload, (line) => {
+        if (line.type === 'progress') {
+          try { onProgress?.(line) } catch { /* ignore */ }
+        } else if (line.type === 'done') {
+          result = line.result
+        } else if (line.type === 'error') {
+          failure = (line.error && line.error.message) || `${endpoint} 失败`
+        }
+      })
+      if (failure) throw new Error(failure)
+      if (result === undefined) throw new Error(`${endpoint} 没有返回结果`)
+      return result
     }
 
     const PHASES = [
@@ -342,7 +369,7 @@ window.__ModuleLoader__.load({
         setNotice('')
         setJob(null)
         try {
-          const value = await callRpc('push', { host: device, project, task })
+          const value = await streamUntilDone('push', { host: device, project, task })
           setJob(value)
           setTask('')
           setNotice('已在云端项目里开始执行')
@@ -756,7 +783,7 @@ window.__ModuleLoader__.load({
         setError('')
         setTaskResult(null)
         try {
-          const value = await callRpc('push', { host: device, project: current, task: taskText.trim() })
+          const value = await streamUntilDone('push', { host: device, project: current, task: taskText.trim() })
           setTaskResult(value)
           setTaskText('')
           await openProject(current)
