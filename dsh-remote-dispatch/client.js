@@ -959,7 +959,7 @@ window.__ModuleLoader__.load({
               h('input', {
                 className: 'drd-input',
                 value: form.label,
-                placeholder: '阿里云 2H2C',
+                placeholder: '我的云主机 A',
                 onChange: (e) => setForm((f) => ({ ...f, label: e.target.value, name: f.editing ? f.name : '' })),
                 disabled: busy,
               }),

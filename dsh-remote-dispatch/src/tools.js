@@ -250,7 +250,7 @@ export function registerTools(ctx, service, settings) {
           description: 'list=列出；bind=绑定/更新；unbind=解绑；setDefault=设为默认；sshCredentials=列出可绑定的 SSH 凭据。',
         },
         name: { type: 'string', description: '设备名（字母数字-_），bind/unbind/setDefault 用。' },
-        label: { type: 'string', description: '显示名，如「阿里云 2H2C」。' },
+        label: { type: 'string', description: '显示名，如「我的云主机 A」。' },
         credentialId: { type: 'string', description: '绑定的 SSH 凭据 id（从 sshCredentials 获取）。' },
         workRoot: { type: 'string', description: '云端工作根目录，留空则用 ~/dsh-work。' },
         note: { type: 'string', description: '备注。' },

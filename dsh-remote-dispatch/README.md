@@ -116,7 +116,7 @@
 // 派发：上传本地项目 + 指定项目名
 remote_dispatch({
   task: "跑通测试并修复失败项，最后汇报改了哪些文件",
-  localDir: "C:/Users/tragi/projects/mytool",
+  localDir: "C:/Users/you/projects/mytool",
   project: "mytool",
   host: "aliyun"
 })
@@ -239,5 +239,7 @@ dsh-remote-dispatch/
 │   ├── rpc.js          Browser ⇄ Host 接口（含 NDJSON 进度流）
 │   ├── tools.js        11 个 agent 工具
 │   └── validate.js     参数校验（jobId / 路径等）
-└── remote/dsh-job.sh   云端执行器（装到云主机 /usr/local/bin/dsh-job）
+├── remote/dsh-job.sh   云端执行器（装到云主机 /usr/local/bin/dsh-job）
+└── docs/
+    └── audit-2026-11-10/  代码审计归档（历史快照，见其中 README）
 ```
